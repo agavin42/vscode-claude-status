@@ -1,0 +1,135 @@
+{
+  "name": "claude-code-status",
+  "displayName": "Claude Code Status",
+  "description": "Dynamic terminal titles and colors for Claude Code sessions",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.108.0"
+  },
+  "enabledApiProposals": [
+    "terminalDataWriteEvent"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "views": {
+      "scm": [
+        {
+          "id": "claudeTerminals",
+          "name": "Claude Sessions",
+          "icon": "$(terminal)",
+          "contextualTitle": "Claude Code"
+        }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "claudeCodeStatus.renameTerminal",
+          "when": "view == claudeTerminals",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeStatus.closeTerminal",
+          "when": "view == claudeTerminals",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeStatus.focusTerminal",
+          "when": "view == claudeTerminals"
+        },
+        {
+          "command": "claudeCodeStatus.closeTerminal",
+          "when": "view == claudeTerminals",
+          "group": "2_close"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "claudeCodeStatus.newTerminal",
+          "when": "view == claudeTerminals",
+          "group": "navigation"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claudeCodeStatus.newTerminal",
+        "title": "Claude Code: New Terminal",
+        "icon": "$(add)"
+      },
+      {
+        "command": "claudeCodeStatus.newTerminalResume",
+        "title": "Claude Code: New Terminal (Resume)",
+        "icon": "$(history)"
+      },
+      {
+        "command": "claudeCodeStatus.showTerminals",
+        "title": "Claude Code: Show Terminals"
+      },
+      {
+        "command": "claudeCodeStatus.focusTerminal",
+        "title": "Focus Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "claudeCodeStatus.renameTerminal",
+        "title": "Rename",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "claudeCodeStatus.closeTerminal",
+        "title": "Close Terminal",
+        "icon": "$(trash)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claudeCodeStatus.newTerminal",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Code Status",
+      "properties": {
+        "claudeCodeStatus.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable terminal status tracking for Claude Code"
+        },
+        "claudeCodeStatus.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log debug info to output channel"
+        },
+        "claudeCodeStatus.permsTimeout": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "description": "Seconds to wait before auto-clearing PERMS state (when permission dialog is dismissed)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.108.1",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.0"
+  }
+}

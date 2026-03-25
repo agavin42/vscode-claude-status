@@ -34,10 +34,12 @@ The extension requires Claude Code hooks to communicate state. Run the install s
 ```
 
 This will:
+
 - Copy `cc-status-hook.sh` to `~/bin/`
 - Configure hooks in `~/.claude/settings.json`
 
 **Note**: The script requires `jq` for JSON manipulation. Install it first if needed:
+
 ```bash
 brew install jq  # macOS
 ```
@@ -64,19 +66,22 @@ The terminal will appear in the Claude Sessions panel and show live status updat
 
 ## Commands
 
-| Command | Keybinding | Description |
-|---------|------------|-------------|
-| Claude Code: New Terminal | Cmd+Shift+C | Create new tracked Claude terminal |
-| Claude Code: New Terminal (Resume) | — | Create terminal with `--resume` flag |
-| Claude Code: Show Terminals | — | Quick pick of all terminals |
+| Command                            | Keybinding  | Description                          |
+| ---------------------------------- | ----------- | ------------------------------------ |
+| Claude Code: New Terminal          | Cmd+Shift+C | Create new tracked Claude terminal   |
+| Claude Code: New Terminal (Resume) | —           | Create terminal with `--resume` flag |
+| Claude Code: Show Terminals        | —           | Quick pick of all terminals          |
 
 ## Configuration
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `claudeCodeStatus.enabled` | `true` | Enable the extension |
-| `claudeCodeStatus.debug` | `false` | Log state changes to output channel |
-| `claudeCodeStatus.permsTimeout` | `60` | Seconds before PERMS/WAITING auto-transitions to TIMED OUT |
+| Setting                          | Default    | Description                                                                                                                                                      |
+| -------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claudeCodeStatus.enabled`       | `true`     | Enable the extension                                                                                                                                             |
+| `claudeCodeStatus.debug`         | `false`    | Log state changes to output channel                                                                                                                              |
+| `claudeCodeStatus.permsTimeout`  | `60`       | Seconds before PERMS/WAITING auto-transitions to TIMED OUT                                                                                                       |
+| `claudeCodeStatus.remoteControl` | `false`    | Launch terminals with `--remote-control` for Claude Code app connectivity. Session names sync with the panel (rename propagates via `/rename`).                  |
+| `claudeCodeStatus.command`       | `"claude"` | The command to run in new terminals (e.g. `"claude"`, `"claude-code"`, `"/path/to/my-wrapper"`).                                                                 |
+| `claudeCodeStatus.extraArgs`     | `[]`       | Extra arguments passed to the command on terminal creation (e.g. `["--model", "sonnet"]`). Set per-user in User Settings or per-repo in `.vscode/settings.json`. |
 
 ---
 
@@ -89,18 +94,18 @@ The terminal will appear in the Claude Sessions panel and show live status updat
 
 ### Hook Events → States
 
-| Hook Event | Condition | State |
-|------------|-----------|-------|
-| `PreToolUse` | — | BUSY |
-| `PostToolUse` | — | BUSY |
-| `PermissionRequest` | `AskUserQuestion` | WAITING |
-| `PermissionRequest` | (other tools) | PERMS |
-| `UserPromptSubmit` | — | BUSY |
-| `Stop` | — | IDLE |
-| `Notification` | `waiting_for_user_action` | WAITING |
-| `Notification` | `idle_timeout` | IDLE |
-| `SessionStart` | — | IDLE |
-| `SessionEnd` | — | (cleanup) |
+| Hook Event          | Condition                 | State     |
+| ------------------- | ------------------------- | --------- |
+| `PreToolUse`        | —                         | BUSY      |
+| `PostToolUse`       | —                         | BUSY      |
+| `PermissionRequest` | `AskUserQuestion`         | WAITING   |
+| `PermissionRequest` | (other tools)             | PERMS     |
+| `UserPromptSubmit`  | —                         | BUSY      |
+| `Stop`              | —                         | IDLE      |
+| `Notification`      | `waiting_for_user_action` | WAITING   |
+| `Notification`      | `idle_timeout`            | IDLE      |
+| `SessionStart`      | —                         | IDLE      |
+| `SessionEnd`        | —                         | (cleanup) |
 
 ### Timeout Behavior
 
@@ -143,8 +148,14 @@ Add to `~/.claude/settings.json`:
       { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
     ],
     "Notification": [
-      { "matcher": "idle_timeout", "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] },
-      { "matcher": "waiting_for_user_action", "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+      {
+        "matcher": "idle_timeout",
+        "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }]
+      },
+      {
+        "matcher": "waiting_for_user_action",
+        "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }]
+      }
     ],
     "SessionStart": [
       { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
@@ -226,11 +237,11 @@ Press F5 to launch Extension Development Host.
 
 ### Common Issues
 
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| Terminal names empty on restore | VS Code hasn't populated names yet | Retry logic handles this automatically |
-| State not updating | Hooks not configured | Run `./scripts/install-hooks.sh --verify` |
-| BUSY stuck after accepting permission | Missing PostToolUse hook | Ensure PostToolUse is in hooks config |
+| Issue                                 | Cause                              | Solution                                  |
+| ------------------------------------- | ---------------------------------- | ----------------------------------------- |
+| Terminal names empty on restore       | VS Code hasn't populated names yet | Retry logic handles this automatically    |
+| State not updating                    | Hooks not configured               | Run `./scripts/install-hooks.sh --verify` |
+| BUSY stuck after accepting permission | Missing PostToolUse hook           | Ensure PostToolUse is in hooks config     |
 
 ---
 

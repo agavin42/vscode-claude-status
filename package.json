@@ -114,6 +114,24 @@
           "default": 60,
           "minimum": 5,
           "description": "Seconds to wait before auto-clearing PERMS state (when permission dialog is dismissed)"
+        },
+        "claudeCodeStatus.remoteControl": {
+          "type": "boolean",
+          "default": false,
+          "description": "Launch terminals with --remote-control for Claude Code app connectivity"
+        },
+        "claudeCodeStatus.command": {
+          "type": "string",
+          "default": "claude",
+          "description": "The command to run in new terminals (e.g. \"claude\", \"claude-code\", \"/path/to/my-wrapper\")"
+        },
+        "claudeCodeStatus.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments to pass to the claude command (e.g. [\"--model\", \"sonnet\", \"--allowedTools\", \"Bash,Read\"])"
         }
       }
     }

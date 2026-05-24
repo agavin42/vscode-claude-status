@@ -94,18 +94,31 @@ The terminal will appear in the Claude Sessions panel and show live status updat
 
 ### Hook Events → States
 
-| Hook Event          | Condition                 | State     |
-| ------------------- | ------------------------- | --------- |
-| `PreToolUse`        | —                         | BUSY      |
-| `PostToolUse`       | —                         | BUSY      |
-| `PermissionRequest` | `AskUserQuestion`         | WAITING   |
-| `PermissionRequest` | (other tools)             | PERMS     |
-| `UserPromptSubmit`  | —                         | BUSY      |
-| `Stop`              | —                         | IDLE      |
-| `Notification`      | `waiting_for_user_action` | WAITING   |
-| `Notification`      | `idle_timeout`            | IDLE      |
-| `SessionStart`      | —                         | IDLE      |
-| `SessionEnd`        | —                         | (cleanup) |
+| Hook Event          | Condition             | State / Effect                              |
+| ------------------- | --------------------- | ------------------------------------------- |
+| `PreToolUse`        | —                     | BUSY                                        |
+| `PostToolUse`       | —                     | BUSY                                        |
+| `PermissionRequest` | `AskUserQuestion`     | WAITING                                     |
+| `PermissionRequest` | (other tools)         | PERMS                                       |
+| `PermissionDenied`  | —                     | IDLE (clears PERMS without timeout)        |
+| `UserPromptSubmit`  | —                     | BUSY                                        |
+| `Stop`              | —                     | IDLE                                        |
+| `StopFailure`       | —                     | IDLE                                        |
+| `Notification`      | `permission_prompt`   | WAITING                                     |
+| `Notification`      | `idle_prompt`         | IDLE                                        |
+| `Notification`      | `elicitation_dialog`  | WAITING                                     |
+| `Notification`      | `auth_success`        | IDLE                                        |
+| `SessionStart`      | —                     | IDLE; captures `claude --version`           |
+| `SessionEnd`        | —                     | cleanup of all sidecar files                |
+| `CwdChanged`        | —                     | updates `.cwd` (no state change)            |
+| `PreCompact`        | —                     | BUSY                                        |
+| `PostCompact`       | —                     | IDLE; refreshes `session_id`                |
+| `SubagentStart`     | —                     | increments subagent counter                 |
+| `SubagentStop`      | —                     | decrements subagent counter                 |
+
+Every event also writes (when present in the payload) `session_id` → `{ccId}.session`, `cwd` → `{ccId}.cwd`, `transcript_path` → `{ccId}.tx`. These are guaranteed-present fields per the Claude Code docs.
+
+The hook tolerates both new (`permission_prompt`, `idle_prompt`) and legacy (`waiting_for_user_action`, `idle_timeout`) Notification matcher names so a stale `~/.claude/settings.json` won't silently drop events. Re-run `./scripts/install-hooks.sh` to switch to the current matcher names.
 
 ### Timeout Behavior
 
@@ -141,7 +154,13 @@ Add to `~/.claude/settings.json`:
     "PermissionRequest": [
       { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
     ],
+    "PermissionDenied": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
     "Stop": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
+    "StopFailure": [
       { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
     ],
     "UserPromptSubmit": [
@@ -149,11 +168,11 @@ Add to `~/.claude/settings.json`:
     ],
     "Notification": [
       {
-        "matcher": "idle_timeout",
+        "matcher": "permission_prompt",
         "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }]
       },
       {
-        "matcher": "waiting_for_user_action",
+        "matcher": "idle_prompt",
         "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }]
       }
     ],
@@ -161,6 +180,21 @@ Add to `~/.claude/settings.json`:
       { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
     ],
     "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
+    "CwdChanged": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
+    "PostCompact": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
+    ],
+    "SubagentStop": [
       { "hooks": [{ "type": "command", "command": "~/bin/cc-status-hook.sh" }] }
     ]
   }

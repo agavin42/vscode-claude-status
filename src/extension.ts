@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
+import * as crypto from "crypto";
 
 // Terminal state enum
 enum ClaudeState {
@@ -28,349 +29,1030 @@ const STATE_CONFIG: Record<ClaudeState, { label: string; priority: number }> = {
 // State file directory (shared with hook script)
 const STATE_DIR = path.join(os.tmpdir(), "claude-code-status");
 
-// Tracked terminal info
-interface TrackedTerminal {
-  terminal: vscode.Terminal;
-  ccId: string;
-  stateFile: string;
+// Persisted Session record — what survives across VSC reloads
+interface PersistedSession {
+  id: string; // ccId (cc-{ts}-{rand}), stable for lifetime of session
+  displayName: string; // "s:HH:MM:SS" generated at creation
+  customName?: string; // user-assigned via rename
+  directory: string; // absolute cwd; auto-updated from hook .cwd
+  claudeSessionId?: string; // Claude Code's UUID (pre-generated, refreshed from hook)
+  claudeVersion?: string; // from hook .version
+  parentSessionId?: string; // for forked sessions (Phase 7)
+  parentDisplayName?: string;
+  createdAt: number; // epoch ms
+}
+
+// Runtime Session — persistent fields plus transient state. The terminal field
+// is optional: undefined = cold. Phase 3 surfaces cold sessions in the tree;
+// Phase 4 keeps them across reload.
+interface Session extends PersistedSession {
+  terminal?: vscode.Terminal;
   state: ClaudeState;
+  lastPrompt?: string;
+  permsEnteredAt?: number; // ms timestamp when entered PERMS/WAITING
   pollInterval?: NodeJS.Timeout;
-  permsEnteredAt?: number; // Timestamp when entered PERMS state
-  lastPrompt?: string; // Last user prompt (from hook)
-  customName?: string; // User-assigned name
-  displayName?: string; // Auto-generated display name (e.g. s_17_34_04)
-  hasUserInput: boolean; // True after first UserPromptSubmit (ignore startup BUSY until then)
+  hasUserInput: boolean; // suppresses startup-BUSY noise
+  transcriptPath?: string; // from hook .tx (transient — re-derived each run)
+  subagentCount: number; // from hook .subagents
+  // Live cwd from hook. NOT persisted. session.directory stays as the
+  // original launch cwd (where the transcript lives — needed for --resume).
+  // currentCwd tracks where Claude is actually operating right now, for
+  // display purposes only.
+  currentCwd?: string;
+  // Set true for the brief window during remake() so handleTerminalClose
+  // knows the old-terminal dispose belongs to a remake, not a suspend.
+  _remaking?: boolean;
 }
 
-// Maintain ordered list of terminal IDs for stable ordering
-let terminalOrder: string[] = [];
-
-// TreeView provider for Claude terminals with drag-drop support
-class ClaudeTerminalsProvider
-  implements
-    vscode.TreeDataProvider<TrackedTerminal>,
-    vscode.TreeDragAndDropController<TrackedTerminal>
-{
-  private _onDidChangeTreeData = new vscode.EventEmitter<
-    TrackedTerminal | undefined
-  >();
-  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
-
-  // Drag and drop support
-  readonly dropMimeTypes = ["application/vnd.code.tree.claudeterminals"];
-  readonly dragMimeTypes = ["application/vnd.code.tree.claudeterminals"];
-
-  refresh(): void {
-    this._onDidChangeTreeData.fire(undefined);
-  }
-
-  handleDrag(
-    source: readonly TrackedTerminal[],
-    dataTransfer: vscode.DataTransfer,
-  ): void {
-    dataTransfer.set(
-      "application/vnd.code.tree.claudeterminals",
-      new vscode.DataTransferItem(source.map((t) => t.ccId)),
-    );
-  }
-
-  handleDrop(
-    target: TrackedTerminal | undefined,
-    dataTransfer: vscode.DataTransfer,
-  ): void {
-    const transferItem = dataTransfer.get(
-      "application/vnd.code.tree.claudeterminals",
-    );
-    if (!transferItem) return;
-
-    const draggedIds: string[] = transferItem.value;
-    if (!draggedIds || draggedIds.length === 0) return;
-
-    const draggedId = draggedIds[0];
-    const targetId = target?.ccId;
-
-    // Remove dragged item from current position
-    terminalOrder = terminalOrder.filter((id) => id !== draggedId);
-
-    // Insert at new position
-    if (targetId) {
-      const targetIndex = terminalOrder.indexOf(targetId);
-      if (targetIndex >= 0) {
-        terminalOrder.splice(targetIndex, 0, draggedId);
-      } else {
-        terminalOrder.push(draggedId);
-      }
-    } else {
-      // Dropped at end
-      terminalOrder.push(draggedId);
-    }
-
-    this.refresh();
-  }
-
-  getTreeItem(terminal: TrackedTerminal): vscode.TreeItem {
-    const label = terminal.customName || terminal.displayName || `Claude ${terminal.ccId.slice(-6)}`;
-
-    const item = new vscode.TreeItem(
-      label,
-      vscode.TreeItemCollapsibleState.None,
-    );
-
-    // Set icon and colored state prefix based on state
-    let statePrefix = "";
-    switch (terminal.state) {
-      case ClaudeState.Permissions:
-        item.iconPath = new vscode.ThemeIcon(
-          "alert",
-          new vscode.ThemeColor("errorForeground"),
-        );
-        statePrefix = "🔴 PERMS";
-        break;
-      case ClaudeState.TimedOutPerms:
-        item.iconPath = new vscode.ThemeIcon(
-          "warning",
-          new vscode.ThemeColor("editorWarning.foreground"),
-        );
-        statePrefix = "🟠 TIMED OUT (P)";
-        break;
-      case ClaudeState.TimedOutWaiting:
-        item.iconPath = new vscode.ThemeIcon(
-          "warning",
-          new vscode.ThemeColor("editorWarning.foreground"),
-        );
-        statePrefix = "🟠 TIMED OUT (Q)";
-        break;
-      case ClaudeState.Busy:
-        item.iconPath = new vscode.ThemeIcon(
-          "sync~spin",
-          new vscode.ThemeColor("warningForeground"),
-        );
-        statePrefix = "🟡 BUSY";
-        break;
-      case ClaudeState.Waiting:
-        item.iconPath = new vscode.ThemeIcon(
-          "comment-discussion",
-          new vscode.ThemeColor("notificationsInfoIcon.foreground"),
-        );
-        statePrefix = "🔵 WAITING";
-        break;
-      case ClaudeState.Idle:
-        item.iconPath = new vscode.ThemeIcon(
-          "circle-outline",
-          new vscode.ThemeColor("testing.iconPassed"),
-        );
-        statePrefix = "🟢 idle";
-        break;
-      default:
-        item.iconPath = new vscode.ThemeIcon("question");
-        statePrefix = "⚪ ?";
-    }
-
-    // Show state and last prompt as description
-    const promptPreview = terminal.lastPrompt
-      ? terminal.lastPrompt.slice(0, 50) +
-        (terminal.lastPrompt.length > 50 ? "..." : "")
-      : "";
-    item.description = `${statePrefix}${promptPreview ? " · " + promptPreview : ""}`;
-
-    // Tooltip with full info
-    item.tooltip = new vscode.MarkdownString();
-    item.tooltip.appendMarkdown(`**State:** ${statePrefix}\n\n`);
-    if (terminal.lastPrompt) {
-      item.tooltip.appendMarkdown(
-        `**Last prompt:** ${terminal.lastPrompt}\n\n`,
-      );
-    }
-    item.tooltip.appendMarkdown(`*Click to focus terminal*`);
-
-    // Click to focus terminal
-    item.command = {
-      command: "claudeCodeStatus.focusTerminal",
-      title: "Focus Terminal",
-      arguments: [terminal],
-    };
-
-    // Context value for context menu
-    item.contextValue =
-      terminal.state === ClaudeState.Permissions
-        ? "terminal-perms"
-        : "terminal";
-
-    return item;
-  }
-
-  getChildren(): TrackedTerminal[] {
-    // Use custom order if set, otherwise creation order
-    const allTerminals = Array.from(trackedTerminals.values());
-
-    // Add any new terminals not in order list
-    for (const t of allTerminals) {
-      if (!terminalOrder.includes(t.ccId)) {
-        terminalOrder.push(t.ccId);
-      }
-    }
-
-    // Remove any terminals that no longer exist
-    terminalOrder = terminalOrder.filter((id) => trackedTerminals.has(id));
-
-    // Return in order
-    return terminalOrder
-      .map((id) => trackedTerminals.get(id))
-      .filter((t): t is TrackedTerminal => t !== undefined);
-  }
-}
-
-let claudeTerminalsProvider: ClaudeTerminalsProvider;
-
-const trackedTerminals: Map<string, TrackedTerminal> = new Map();
-let statusBarItem: vscode.StatusBarItem;
-let outputChannel: vscode.OutputChannel;
-let extensionContext: vscode.ExtensionContext;
-
-function log(msg: string) {
-  const debug = vscode.workspace
-    .getConfiguration("claudeCodeStatus")
-    .get("debug");
-  if (debug) {
-    outputChannel.appendLine(`[${new Date().toISOString()}] ${msg}`);
-  }
-}
-
-// Persisted state for surviving reloads
-interface PersistedTerminal {
+// Legacy persisted shape — what shipped before Phase 2. Used only by the
+// migration path on restore; future writes always use PersistedSession.
+interface LegacyPersistedTerminal {
   ccId: string;
   customName?: string;
   displayName?: string;
 }
 
-function saveState() {
-  const persisted: PersistedTerminal[] = Array.from(
-    trackedTerminals.values(),
-  ).map((t) => ({
-    ccId: t.ccId,
-    customName: t.customName,
-    displayName: t.displayName,
-  }));
-  extensionContext.workspaceState.update("trackedTerminals", persisted);
-  extensionContext.workspaceState.update("terminalOrder", terminalOrder);
-  log(`Saved state: ${persisted.length} terminals`);
-}
+// SessionStore — single owner of the session map + order. Every mutation
+// saves atomically so the on-disk shape never diverges from in-memory state.
+// Reads are pure (getChildren / all() never mutate).
+class SessionStore {
+  private sessions = new Map<string, Session>();
+  private order: string[] = [];
+  private readonly emitter = new vscode.EventEmitter<void>();
+  readonly onDidChange = this.emitter.event;
 
-function restoreState() {
-  const persisted = extensionContext.workspaceState.get<PersistedTerminal[]>(
-    "trackedTerminals",
-    [],
-  );
-  const savedOrder = extensionContext.workspaceState.get<string[]>(
-    "terminalOrder",
-    [],
-  );
+  constructor(private readonly ctx: vscode.ExtensionContext) {}
 
-  if (persisted.length === 0) {
-    log("No saved state to restore");
-    return;
+  // ----- queries (pure) -----
+
+  get(id: string): Session | undefined {
+    return this.sessions.get(id);
   }
 
-  log(`Restoring state: ${persisted.length} terminals`);
-  log(`Persisted ccIds: ${persisted.map((p) => p.ccId).join(", ")}`);
-  log(
-    `Existing terminals: ${vscode.window.terminals.map((t) => t.name).join(", ")}`,
-  );
+  all(): Session[] {
+    return this.order
+      .map((id) => this.sessions.get(id))
+      .filter((s): s is Session => s !== undefined);
+  }
 
-  // Build a map of ccId -> persisted data
-  const persistedMap = new Map(persisted.map((p) => [p.ccId, p]));
+  warmOnly(): Session[] {
+    return this.all().filter((s) => s.terminal !== undefined);
+  }
 
-  // Try to match existing terminals by name (which contains ccId)
-  for (const terminal of vscode.window.terminals) {
-    // Look for ccId pattern in terminal name: "CC: state [ccId]" or just check if name contains any known ccId
-    for (const [ccId, data] of persistedMap) {
-      const shortId = ccId.slice(-6);
-      if (terminal.name.includes(shortId) || terminal.name.includes(ccId)) {
-        const stateFile = path.join(STATE_DIR, `${ccId}.state`);
+  // ----- mutations (always save) -----
 
-        // Only restore if state file still exists
-        if (fs.existsSync(stateFile)) {
-          // Reset state file to IDLE - any stale BUSY from before reload is meaningless
-          try {
-            fs.writeFileSync(stateFile, "IDLE\n");
-          } catch (e) {
-            // Ignore write errors
-          }
-          const tracked: TrackedTerminal = {
-            terminal,
-            ccId,
-            stateFile,
-            state: ClaudeState.Idle,
-            customName: data.customName,
-            displayName: data.displayName,
-            hasUserInput: true, // Restored terminals have already had user input
-          };
-          trackedTerminals.set(ccId, tracked);
-          watchStateFile(tracked);
-          persistedMap.delete(ccId);
-          log(`Restored terminal ${ccId} -> "${terminal.name}"`);
-          break;
-        }
-      }
+  create(args: {
+    resume?: boolean;
+    dir?: string;
+    forkFrom?: string;
+    customName?: string;
+    parentDisplayName?: string;
+  } = {}): Session | undefined {
+    ensureStateDir();
+
+    const ccId = generateCcId();
+    const stateFile = path.join(STATE_DIR, `${ccId}.state`);
+
+    // Pre-generate the Claude session id (UUID). Passing --session-id at
+    // launch lets us know it before the first hook event fires. The hook
+    // keeps refreshing the .session sidecar so fork/compact-time id changes
+    // are followed automatically.
+    const claudeSessionId = crypto.randomUUID();
+
+    fs.writeFileSync(stateFile, "IDLE\n");
+
+    const workspaceFolder =
+      args.dir ||
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ||
+      os.homedir();
+
+    const config = vscode.workspace.getConfiguration("claudeCodeStatus");
+    const command = config.get<string>("command", "claude");
+    const extraArgs = config.get<string[]>("extraArgs", []);
+    const remoteControl = config.get<boolean>("remoteControl", false);
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    const ss = String(now.getSeconds()).padStart(2, "0");
+    const displayName = `s:${hh}:${mm}:${ss}`;
+
+    // If a customName was supplied (sibling/fork pre-named), pass it to
+    // claude via -n at startup so the Claude Code app sees the right name
+    // from the first frame — no /rename round-trip needed.
+    const sessionName = args.customName || displayName;
+
+    // Build launch command. --session-id only applies on cold start (no
+    // --resume); fork takes precedence over --session-id because
+    // --fork-session generates its own new id.
+    const launchArgs: string[] = [];
+    if (args.forkFrom) {
+      launchArgs.push("--resume", args.forkFrom, "--fork-session");
+    } else if (args.resume) {
+      launchArgs.push("--resume");
+    } else {
+      launchArgs.push("--session-id", claudeSessionId);
     }
-  }
+    launchArgs.push(...extraArgs);
+    if (remoteControl) {
+      launchArgs.push("--remote-control", "-n", `"${sessionName}"`);
+    }
 
-  // Fallback: if we still have unmatched persisted terminals and untracked CC: terminals,
-  // try to match them by state file existence
-  if (persistedMap.size > 0) {
-    log(`Fallback matching: ${persistedMap.size} unmatched persisted`);
-    const unmatchedTerminals = vscode.window.terminals.filter(
-      (t) =>
-        t.name.startsWith("CC:") &&
-        !Array.from(trackedTerminals.values()).some(
-          (tracked) => tracked.terminal === t,
-        ),
-    );
+    const terminal = vscode.window.createTerminal({
+      name: `CC: idle [${displayName}]`,
+      cwd: workspaceFolder,
+      env: { VSCODE_CC_ID: ccId },
+    });
+
+    const session: Session = {
+      id: ccId,
+      displayName,
+      customName: args.customName,
+      directory: workspaceFolder,
+      claudeSessionId,
+      parentSessionId: args.forkFrom,
+      parentDisplayName: args.parentDisplayName,
+      createdAt: Date.now(),
+      terminal,
+      state: ClaudeState.Idle,
+      hasUserInput: false,
+      subagentCount: 0,
+    };
+
+    this.sessions.set(ccId, session);
+    this.order.push(ccId);
+    this.watchSession(session);
+    this.save();
+    this.emitter.fire();
+
+    terminal.sendText(`${command} ${launchArgs.join(" ")}`);
+
     log(
-      `Unmatched CC: terminals: ${unmatchedTerminals.map((t) => t.name).join(", ") || "none"}`,
+      `Created session ${ccId} (claudeSessionId=${claudeSessionId}, dir=${workspaceFolder}, name=${sessionName}, forkFrom=${args.forkFrom ?? "none"})`,
+    );
+    return session;
+  }
+
+  // New sibling — fresh Claude conversation in the source session's directory.
+  // Allowed on warm AND cold sources (directory is on the persisted record).
+  newSibling(sourceId: string, name?: string): Session | undefined {
+    const src = this.sessions.get(sourceId);
+    if (!src) return undefined;
+    return this.create({
+      dir: src.directory,
+      customName: name,
+    });
+  }
+
+  // Fork — new session that inherits the source's conversation via
+  // `claude --resume <id> --fork-session`. Source untouched.
+  fork(sourceId: string, name?: string): Session | undefined {
+    const src = this.sessions.get(sourceId);
+    if (!src) return undefined;
+    if (!src.claudeSessionId) {
+      vscode.window.showWarningMessage(
+        `Cannot fork "${src.customName || src.displayName}" — no Claude session id captured yet. Type something in it first.`,
+      );
+      return undefined;
+    }
+    return this.create({
+      dir: src.directory,
+      forkFrom: src.claudeSessionId,
+      customName: name,
+      parentDisplayName: src.customName || src.displayName,
+    });
+  }
+
+  // Reconnect remote-control — sends /remote-control to a warm terminal.
+  // No-op for cold sessions (nothing to send to).
+  reconnectRemoteControl(id: string): void {
+    const s = this.sessions.get(id);
+    if (!s || !s.terminal) return;
+    s.terminal.sendText("/remote-control");
+    log(`Sent /remote-control to ${id}`);
+  }
+
+  adopt(terminal: vscode.Terminal): Session {
+    ensureStateDir();
+
+    const ccId = generateCcId();
+    const stateFile = path.join(STATE_DIR, `${ccId}.state`);
+    fs.writeFileSync(stateFile, "IDLE\n");
+
+    // No --session-id for adoption (the already-running claude has its own
+    // id); rely on the hook to populate .session on next event.
+    terminal.sendText(`export VSCODE_CC_ID=${ccId}`, true);
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    const ss = String(now.getSeconds()).padStart(2, "0");
+    const displayName = `s:${hh}:${mm}:${ss}`;
+
+    const session: Session = {
+      id: ccId,
+      displayName,
+      directory:
+        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir(),
+      createdAt: Date.now(),
+      terminal,
+      state: ClaudeState.Idle,
+      hasUserInput: false,
+      subagentCount: 0,
+    };
+
+    this.sessions.set(ccId, session);
+    this.order.push(ccId);
+    this.watchSession(session);
+    this.save();
+    this.emitter.fire();
+
+    log(`Adopted terminal "${terminal.name}" as session ${ccId}`);
+    return session;
+  }
+
+  // Suspend — terminal dies, session record stays as cold. Reachable via the
+  // inline pause button or right-click. Reversible via Remake.
+  suspend(id: string): void {
+    const s = this.sessions.get(id);
+    if (!s || !s.terminal) return; // already cold or unknown
+    // The terminal dispose triggers handleTerminalClose, which (since
+    // _remaking is not set) marks the session cold for us.
+    s.terminal.dispose();
+  }
+
+  // Remake — recreate the terminal in the same directory, resume the same
+  // Claude conversation, reuse the same ccId. Works on both warm and cold
+  // sessions. Requires claudeSessionId; refuses if unknown.
+  remake(id: string): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    if (!s.claudeSessionId) {
+      vscode.window.showWarningMessage(
+        `Cannot remake "${s.customName || s.displayName}" — no Claude session id captured yet. Type something in the session first so the hook populates it.`,
+      );
+      return;
+    }
+
+    ensureStateDir();
+    const stateFile = path.join(STATE_DIR, `${s.id}.state`);
+
+    // Flag for the close handler. Cleared after the new terminal is bound.
+    s._remaking = true;
+
+    // Stop the existing poll so it can't race with the new terminal's poll.
+    this.stopWatching(s);
+
+    // Dispose the old terminal (if any). The close handler runs async; it
+    // sees _remaking and no-ops.
+    if (s.terminal) {
+      s.terminal.dispose();
+    }
+
+    // Reset transient sidecars. .session stays — --resume reads from the
+    // existing transcript identified by claudeSessionId. .cwd / .tx will
+    // be rewritten by the hook on first event.
+    try {
+      fs.writeFileSync(stateFile, "IDLE\n");
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      fs.unlinkSync(path.join(STATE_DIR, `${s.id}.prompt`));
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      fs.unlinkSync(path.join(STATE_DIR, `${s.id}.version`));
+    } catch (e) {
+      /* ignore */
+    }
+
+    // Reset runtime state — re-arm startup-BUSY suppression for the new claude.
+    s.state = ClaudeState.Idle;
+    s.lastPrompt = undefined;
+    s.hasUserInput = false;
+    s.permsEnteredAt = undefined;
+    s.subagentCount = 0;
+    s.transcriptPath = undefined;
+
+    const config = vscode.workspace.getConfiguration("claudeCodeStatus");
+    const command = config.get<string>("command", "claude");
+    const extraArgs = config.get<string[]>("extraArgs", []);
+    const remoteControl = config.get<boolean>("remoteControl", false);
+
+    // Preserve the user-assigned name across remake. If the user previously
+    // ran `/rename` on this session (via the panel rename), customName is
+    // what the Claude Code app showed it as — use that for -n so the
+    // resumed session keeps the same identity. Falls back to displayName
+    // for sessions that were never renamed.
+    const sessionName = s.customName || s.displayName;
+
+    const launchArgs: string[] = ["--resume", s.claudeSessionId];
+    launchArgs.push(...extraArgs);
+    if (remoteControl) {
+      launchArgs.push("--remote-control", "-n", `"${sessionName}"`);
+    }
+
+    const newTerminal = vscode.window.createTerminal({
+      name: `CC: idle [${s.displayName}]`,
+      cwd: s.directory,
+      env: { VSCODE_CC_ID: s.id },
+    });
+
+    s.terminal = newTerminal;
+    s._remaking = false;
+
+    this.watchSession(s);
+    this.save();
+    this.emitter.fire();
+
+    newTerminal.sendText(`${command} ${launchArgs.join(" ")}`);
+    newTerminal.show();
+
+    log(
+      `Remade session ${s.id} (--resume ${s.claudeSessionId}, name=${sessionName}, dir=${s.directory})`,
+    );
+  }
+
+  // Delete — destructive. Drops the session record and unlinks all sidecar
+  // files. Caller (the command handler) shows the confirmation dialog;
+  // the store assumes the caller already confirmed.
+  delete(id: string): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    this.stopWatching(s);
+    const terminal = s.terminal;
+    // Remove from store BEFORE disposing the terminal — handleTerminalClose
+    // looks up by terminal and will find nothing, no-op.
+    this.sessions.delete(id);
+    this.order = this.order.filter((x) => x !== id);
+    if (terminal) {
+      terminal.dispose();
+    }
+    // Unlink every sidecar Phase 1 may have written.
+    for (const ext of ["state", "session", "cwd", "tx", "version", "prompt", "subagents"]) {
+      try {
+        fs.unlinkSync(path.join(STATE_DIR, `${id}.${ext}`));
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    this.save();
+    this.emitter.fire();
+    log(`Deleted session ${id}`);
+  }
+
+  update(id: string, patch: Partial<PersistedSession>): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    Object.assign(s, patch);
+    this.save();
+    this.emitter.fire();
+  }
+
+  reorder(draggedId: string, targetId: string | undefined): void {
+    this.order = this.order.filter((id) => id !== draggedId);
+    if (targetId) {
+      const targetIndex = this.order.indexOf(targetId);
+      if (targetIndex >= 0) {
+        this.order.splice(targetIndex, 0, draggedId);
+      } else {
+        this.order.push(draggedId);
+      }
+    } else {
+      this.order.push(draggedId);
+    }
+    this.save();
+    this.emitter.fire();
+  }
+
+  // ----- persistence -----
+
+  save(): void {
+    // Write both `id` (new shape) and `ccId` (legacy field name) so an
+    // older extension binary can still parse this on rollback.
+    const persisted = Array.from(this.sessions.values()).map((s) => ({
+      id: s.id,
+      ccId: s.id,
+      displayName: s.displayName,
+      customName: s.customName,
+      directory: s.directory,
+      claudeSessionId: s.claudeSessionId,
+      claudeVersion: s.claudeVersion,
+      parentSessionId: s.parentSessionId,
+      parentDisplayName: s.parentDisplayName,
+      createdAt: s.createdAt,
+    }));
+    this.ctx.workspaceState.update("trackedTerminals", persisted);
+    this.ctx.workspaceState.update("terminalOrder", this.order);
+    log(`Saved state: ${persisted.length} sessions, order=${this.order.length}`);
+  }
+
+  restore(): void {
+    // Read both new and legacy shapes from the same key. We can tell which
+    // we got by checking for the new "directory" field — legacy entries
+    // don't have it.
+    const persistedRaw = this.ctx.workspaceState.get<
+      (PersistedSession | LegacyPersistedTerminal)[]
+    >("trackedTerminals", []);
+    const savedOrder = this.ctx.workspaceState.get<string[]>(
+      "terminalOrder",
+      [],
     );
 
-    for (const terminal of unmatchedTerminals) {
-      for (const [ccId, data] of persistedMap) {
-        const stateFile = path.join(STATE_DIR, `${ccId}.state`);
-        log(
-          `Checking state file: ${stateFile} exists=${fs.existsSync(stateFile)}`,
-        );
-        if (fs.existsSync(stateFile)) {
-          // Reset state file to IDLE - any stale BUSY from before reload is meaningless
-          try {
-            fs.writeFileSync(stateFile, "IDLE\n");
-          } catch (e) {
-            // Ignore write errors
-          }
-          const tracked: TrackedTerminal = {
-            terminal,
-            ccId,
-            stateFile,
-            state: ClaudeState.Idle,
-            customName: data.customName,
-            displayName: data.displayName,
-            hasUserInput: true,
-          };
-          trackedTerminals.set(ccId, tracked);
-          watchStateFile(tracked);
-          persistedMap.delete(ccId);
+    if (persistedRaw.length === 0) {
+      log("No saved state to restore");
+      return;
+    }
+
+    log(
+      `Restoring state: ${persistedRaw.length} persisted entries, ${savedOrder.length} order entries`,
+    );
+
+    // Migrate any legacy entries up to the new shape. Sidecar files written
+    // by Phase 1's hook may already carry session id, version — read them so
+    // existing sessions get their fields populated immediately. Note:
+    // sidecar .cwd is NO LONGER used to set .directory because directory is
+    // supposed to be the immutable launch cwd, and sidecar tracks the live
+    // cwd which may have drifted (worktree moves, etc.).
+    const migrated: PersistedSession[] = persistedRaw.map((p) => {
+      const ccId = "id" in p ? p.id : p.ccId;
+      const sidecarSession = readSidecar(ccId, "session");
+      const sidecarVersion = readSidecar(ccId, "version");
+
+      if ("directory" in p) {
+        // Already new shape. Auto-repair the historical drift bug where
+        // hook .cwd overwrote session.directory whenever Claude `cd`'d
+        // into a worktree, breaking --resume on Remake. If the stored
+        // directory contains a `/.claude/worktrees/<name>` segment, strip
+        // back to the project root.
+        const repaired = repairWorktreeDrift(p.directory);
+        if (repaired !== p.directory) {
           log(
-            `Restored terminal ${ccId} -> "${terminal.name}" (fallback match)`,
+            `Auto-repairing ${ccId} directory: ${p.directory} → ${repaired}`,
           );
+        }
+        return {
+          ...p,
+          directory: repaired,
+          claudeSessionId: sidecarSession || p.claudeSessionId,
+          claudeVersion: sidecarVersion || p.claudeVersion,
+        };
+      }
+      // Legacy entry — migrate up. Fill defaults for new fields.
+      const sidecarCwd = readSidecar(ccId, "cwd");
+      const seedDirectory =
+        sidecarCwd ||
+        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ||
+        os.homedir();
+      return {
+        id: p.ccId,
+        displayName: p.displayName || `s:${p.ccId.slice(-6)}`,
+        customName: p.customName,
+        directory: repairWorktreeDrift(seedDirectory),
+        claudeSessionId: sidecarSession || undefined,
+        claudeVersion: sidecarVersion || undefined,
+        createdAt: Date.now(), // unknown for legacy — use now as a placeholder
+      };
+    });
+
+    const persistedById = new Map<string, PersistedSession>();
+    for (const p of migrated) {
+      persistedById.set(p.id, p);
+    }
+
+    log(
+      `Existing terminals: ${vscode.window.terminals.map((t) => t.name).join(", ") || "none"}`,
+    );
+
+    // Match by short-id substring in terminal name. Two passes — exact match
+    // by displayName first (more recent format), then fallback by ccId tail.
+    for (const terminal of vscode.window.terminals) {
+      for (const [ccId, data] of persistedById) {
+        const displayName = data.displayName;
+        const shortId = ccId.slice(-6);
+        if (
+          terminal.name.includes(displayName) ||
+          terminal.name.includes(shortId) ||
+          terminal.name.includes(ccId)
+        ) {
+          this.bindLegacyMatchedTerminal(data, terminal);
+          persistedById.delete(ccId);
           break;
         }
       }
     }
+
+    // Fallback: any persisted entry gets matched to the first "CC:"
+    // terminal we haven't bound yet (handles cases where displayName
+    // wasn't yet populated when terminals were restored). State-file
+    // existence is no longer a gate — bindLegacyMatchedTerminal recreates
+    // it if missing.
+    if (persistedById.size > 0) {
+      const unmatchedTerminals = vscode.window.terminals.filter(
+        (t) =>
+          t.name.startsWith("CC:") &&
+          !Array.from(this.sessions.values()).some((s) => s.terminal === t),
+      );
+      for (const terminal of unmatchedTerminals) {
+        const next = persistedById.entries().next();
+        if (next.done) break;
+        const [ccId, data] = next.value;
+        this.bindLegacyMatchedTerminal(data, terminal);
+        persistedById.delete(ccId);
+        log(`Restored ${ccId} via fallback match to "${terminal.name}"`);
+      }
+    }
+
+    // Phase 4: persisted entries without a matching terminal survive as
+    // cold sessions. They render with ❄️ and can be remade.
+    for (const [, data] of persistedById) {
+      const cold: Session = {
+        ...data,
+        terminal: undefined,
+        state: ClaudeState.Idle,
+        hasUserInput: true, // restored, has had user input
+        subagentCount: 0,
+      };
+      this.sessions.set(data.id, cold);
+      log(`Restored ${data.id} as cold (no live terminal)`);
+    }
+
+    // Order: restore from saved, filtered to sessions we actually have.
+    // New entries (somehow not in saved order) get appended.
+    const orderedKnown = savedOrder.filter((id) => this.sessions.has(id));
+    const unordered = Array.from(this.sessions.keys()).filter(
+      (id) => !orderedKnown.includes(id),
+    );
+    this.order = [...orderedKnown, ...unordered];
+
+    // Flush reconciled state immediately so disk reflects what we loaded.
+    this.save();
+    this.emitter.fire();
   }
 
-  // Restore order, filtering out any that weren't restored
-  terminalOrder = savedOrder.filter((id) => trackedTerminals.has(id));
+  // Binds a persisted entry to a terminal during restore. Robust to a
+  // missing state file: recreates it as IDLE rather than dropping the
+  // session. Previously, a missing state file caused a silent drop —
+  // mole-sync vanished this way on 2026-05-24 after its remake failed
+  // (claude --resume errored, fired SessionEnd, hook unlinked all sidecars,
+  // restore couldn't find them, session removed from workspaceState).
+  private bindLegacyMatchedTerminal(
+    data: PersistedSession,
+    terminal: vscode.Terminal,
+  ): void {
+    const stateFile = path.join(STATE_DIR, `${data.id}.state`);
+    // Always (re)write IDLE — stale BUSY from before reload is meaningless,
+    // and a missing file would otherwise drop the session.
+    try {
+      fs.writeFileSync(stateFile, "IDLE\n");
+    } catch (e) {
+      /* ignore */
+    }
+    const session: Session = {
+      ...data,
+      terminal,
+      state: ClaudeState.Idle,
+      hasUserInput: true, // restored sessions have already had user input
+      subagentCount: 0,
+    };
+    this.sessions.set(data.id, session);
+    this.watchSession(session);
+    log(`Restored session ${data.id} -> "${terminal.name}"`);
+  }
 
-  updateStatusBar();
+  // Phase 3: terminal disposal => mark session cold (keep record). The
+  // user-visible "X" button on a terminal pane, our Suspend command, and
+  // any other terminal-close path all funnel through here.
+  // Exception: when _remaking is set we ignore the close — remake() is
+  // about to bind a fresh terminal to the same session.
+  // Real deletion happens via store.delete() called from the Delete command.
+  handleTerminalClose(terminal: vscode.Terminal): void {
+    for (const s of this.sessions.values()) {
+      if (s._remaking) continue;
+      if (s.terminal === terminal) {
+        this.markCold(s);
+        return;
+      }
+    }
+  }
+
+  private markCold(s: Session): void {
+    this.stopWatching(s);
+    s.terminal = undefined;
+    s.lastPrompt = undefined;
+    s.permsEnteredAt = undefined;
+    s.transcriptPath = undefined;
+    s.subagentCount = 0;
+    // Leave .session / .version / .cwd sidecars in place — they're the
+    // memory of what this session was, useful for Remake. .state and
+    // .prompt are transient and would lie now; reset .state and unlink
+    // .prompt so cold sessions don't show stale data.
+    try {
+      fs.writeFileSync(
+        path.join(STATE_DIR, `${s.id}.state`),
+        "IDLE\n",
+      );
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      fs.unlinkSync(path.join(STATE_DIR, `${s.id}.prompt`));
+    } catch (e) {
+      /* ignore */
+    }
+    this.save();
+    this.emitter.fire();
+    log(`Marked session ${s.id} cold`);
+  }
+
+  // ----- polling -----
+
+  private watchSession(session: Session): void {
+    const stateFile = path.join(STATE_DIR, `${session.id}.state`);
+    const pollInterval = setInterval(() => {
+      if (!this.sessions.has(session.id)) {
+        clearInterval(pollInterval);
+        return;
+      }
+
+      const newState = parseStateFile(stateFile);
+      const newPrompt = readSidecar(session.id, "prompt");
+      const newSessionId = readSidecar(session.id, "session");
+      const newCwd = readSidecar(session.id, "cwd");
+      const newTranscript = readSidecar(session.id, "tx");
+      const newVersion = readSidecar(session.id, "version");
+      const newSubagents = readSidecar(session.id, "subagents");
+      const now = Date.now();
+
+      let mutated = false;
+
+      // Prompt: signal of "user has typed something" (suppresses startup BUSY)
+      if (newPrompt && newPrompt !== session.lastPrompt) {
+        session.lastPrompt = newPrompt;
+        session.hasUserInput = true;
+      }
+
+      // Persistent fields populated by hook — only save if changed (cheap diff)
+      if (newSessionId && newSessionId !== session.claudeSessionId) {
+        session.claudeSessionId = newSessionId;
+        mutated = true;
+      }
+      // session.directory stays as the LAUNCH cwd (where transcripts live).
+      // newCwd from the hook tracks where Claude has wandered to via `cd` or
+      // worktree moves — useful for display, but never used to overwrite the
+      // launch cwd. Routing it through directory broke --resume across
+      // worktrees because transcripts are keyed by project hash of launch cwd.
+      if (newCwd && newCwd !== session.currentCwd) {
+        session.currentCwd = newCwd; // transient, no save
+      }
+      if (newTranscript && newTranscript !== session.transcriptPath) {
+        session.transcriptPath = newTranscript; // transient, no save
+      }
+      if (newVersion && newVersion !== session.claudeVersion) {
+        session.claudeVersion = newVersion;
+        mutated = true;
+      }
+      if (newSubagents !== undefined) {
+        const n = parseInt(newSubagents, 10);
+        if (!isNaN(n) && n !== session.subagentCount) {
+          session.subagentCount = n; // transient — count not persisted
+        }
+      }
+
+      // PERMS/WAITING timeout
+      if (
+        session.state === ClaudeState.Permissions ||
+        session.state === ClaudeState.Waiting
+      ) {
+        const timeoutSeconds = vscode.workspace
+          .getConfiguration("claudeCodeStatus")
+          .get<number>("permsTimeout", 60);
+        if (
+          session.permsEnteredAt &&
+          now - session.permsEnteredAt > timeoutSeconds * 1000
+        ) {
+          const wasPerms = session.state === ClaudeState.Permissions;
+          const transitionTo = wasPerms
+            ? ClaudeState.TimedOutPerms
+            : ClaudeState.TimedOutWaiting;
+          const stateToken = wasPerms ? "TIMEDOUT-PERMS" : "TIMEDOUT-WAITING";
+          log(
+            `${session.state} timeout for ${session.id} after ${timeoutSeconds}s, marking ${stateToken}`,
+          );
+          session.state = transitionTo;
+          session.permsEnteredAt = undefined;
+          try {
+            fs.writeFileSync(stateFile, `${stateToken}\n`);
+          } catch (e) {
+            /* ignore */
+          }
+          this.emitter.fire();
+          updateStatusBar();
+          return;
+        }
+      }
+
+      if (newState !== session.state) {
+        // Suppress startup BUSY (git status, glob, etc. before user typed)
+        if (!session.hasUserInput && newState === ClaudeState.Busy) {
+          log(`Ignoring BUSY before user input for ${session.id}`);
+          return;
+        }
+
+        log(`State change ${session.id}: ${session.state} -> ${newState}`);
+        if (
+          newState === ClaudeState.Permissions ||
+          newState === ClaudeState.Waiting
+        ) {
+          session.permsEnteredAt = now;
+        } else {
+          session.permsEnteredAt = undefined;
+        }
+        session.state = newState;
+        this.emitter.fire();
+        updateStatusBar();
+      } else if (mutated) {
+        // Persistent field changed but state didn't — still save (cheap)
+        this.save();
+      }
+    }, 100);
+
+    session.pollInterval = pollInterval;
+  }
+
+  private stopWatching(session: Session): void {
+    if (session.pollInterval) {
+      clearInterval(session.pollInterval);
+      session.pollInterval = undefined;
+    }
+  }
+
+  // Called from deactivate() — stop polling but DO NOT delete state files,
+  // they're needed for restore after reload.
+  stopAllPolling(): void {
+    for (const s of this.sessions.values()) {
+      this.stopWatching(s);
+    }
+  }
 }
 
-function ensureStateDir() {
+// CommandChannel — file-RPC for the cc-status CLI and /cc slash command.
+// Polls $TMPDIR/claude-code-status/cmd/*.req at 200ms, atomic-renames each
+// to .taken before processing (prevents double-fire across VS Code windows),
+// dispatches to SessionStore methods, writes .res with the outcome.
+class CommandChannel {
+  private interval?: NodeJS.Timeout;
+  private readonly cmdDir = path.join(STATE_DIR, "cmd");
+
+  constructor(private readonly store: SessionStore) {}
+
+  start(): void {
+    try {
+      fs.mkdirSync(this.cmdDir, { recursive: true });
+    } catch (e) {
+      /* ignore */
+    }
+    this.interval = setInterval(() => this.poll(), 200);
+  }
+
+  stop(): void {
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = undefined;
+    }
+  }
+
+  private poll(): void {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.cmdDir);
+    } catch (e) {
+      return;
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".req")) continue;
+      const reqPath = path.join(this.cmdDir, name);
+      const takenPath = reqPath.replace(/\.req$/, ".taken");
+      // Atomic claim: rename wins across processes on POSIX. If two windows
+      // race, only one rename succeeds; the loser sees ENOENT next time.
+      try {
+        fs.renameSync(reqPath, takenPath);
+      } catch (e) {
+        continue;
+      }
+      this.handle(takenPath);
+    }
+  }
+
+  private handle(takenPath: string): void {
+    const nonce = path
+      .basename(takenPath)
+      .replace(/\.taken$/, "");
+    const resPath = path.join(this.cmdDir, `${nonce}.res`);
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(takenPath, "utf-8");
+    } catch (e) {
+      writeRes(resPath, { ok: false, error: `read failed: ${e}` });
+      cleanupTaken(takenPath);
+      return;
+    }
+
+    let req: { cmd?: string; from?: string; args?: Record<string, unknown> };
+    try {
+      req = JSON.parse(raw);
+    } catch (e) {
+      writeRes(resPath, { ok: false, error: `bad JSON: ${e}` });
+      cleanupTaken(takenPath);
+      return;
+    }
+
+    const cmd = req.cmd;
+    const args = req.args || {};
+    const from = req.from;
+    log(`CommandChannel: cmd=${cmd} from=${from} args=${JSON.stringify(args)}`);
+
+    let result: Record<string, unknown> = {};
+    try {
+      switch (cmd) {
+        case "sibling":
+          result = this.dispatchSibling(from, args);
+          break;
+        case "fork":
+          result = this.dispatchFork(from, args);
+          break;
+        case "heal":
+          result = this.dispatchHeal(from, args);
+          break;
+        case "remake":
+          result = this.dispatchRemake(from, args);
+          break;
+        case "rename":
+          result = this.dispatchRename(from, args);
+          break;
+        case "list":
+          result = this.dispatchList();
+          break;
+        case "get":
+          result = this.dispatchGet(from, args);
+          break;
+        default:
+          writeRes(resPath, { ok: false, error: `unknown cmd: ${cmd}` });
+          cleanupTaken(takenPath);
+          return;
+      }
+      writeRes(resPath, { ok: true, result });
+    } catch (e) {
+      writeRes(resPath, { ok: false, error: String(e) });
+    }
+    cleanupTaken(takenPath);
+  }
+
+  // Resolves a source session reference: explicit --id wins, then --name,
+  // then "from" (the env-injected caller ccId) as a self-targeting default.
+  private resolveSource(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Session | undefined {
+    const explicitId = typeof args.id === "string" ? args.id : undefined;
+    const byName = typeof args.name === "string" ? args.name : undefined;
+    if (explicitId) return this.store.get(explicitId);
+    if (byName) {
+      return this.store
+        .all()
+        .find(
+          (s) =>
+            s.customName === byName ||
+            s.displayName === byName ||
+            s.id === byName,
+        );
+    }
+    return from ? this.store.get(from) : undefined;
+  }
+
+  private dispatchSibling(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const src = this.resolveSource(from, args);
+    if (!src) throw new Error("source session not found in this window");
+    const name = typeof args.new_name === "string" ? args.new_name : undefined;
+    const newSess = this.store.newSibling(src.id, name);
+    if (!newSess) throw new Error("sibling creation failed");
+    return sessionSummary(newSess);
+  }
+
+  private dispatchFork(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const src = this.resolveSource(from, args);
+    if (!src) throw new Error("source session not found in this window");
+    const name = typeof args.new_name === "string" ? args.new_name : undefined;
+    const newSess = this.store.fork(src.id, name);
+    if (!newSess) throw new Error("fork failed (missing claudeSessionId?)");
+    return sessionSummary(newSess);
+  }
+
+  private dispatchHeal(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const target = this.resolveSource(from, args);
+    if (!target) throw new Error("target session not found in this window");
+    if (!target.terminal) throw new Error("target is cold; remake first");
+    this.store.reconnectRemoteControl(target.id);
+    return sessionSummary(target);
+  }
+
+  private dispatchRemake(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const target = this.resolveSource(from, args);
+    if (!target) throw new Error("target session not found in this window");
+    this.store.remake(target.id);
+    return sessionSummary(target);
+  }
+
+  private dispatchRename(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const target = this.resolveSource(from, args);
+    if (!target) throw new Error("target session not found in this window");
+    const newName = typeof args.new_name === "string" ? args.new_name : undefined;
+    if (!newName) throw new Error("missing --name");
+    this.store.update(target.id, { customName: newName });
+    if (
+      target.terminal &&
+      vscode.workspace
+        .getConfiguration("claudeCodeStatus")
+        .get<boolean>("remoteControl", false)
+    ) {
+      target.terminal.sendText(`/rename ${newName}`);
+    }
+    return sessionSummary(target);
+  }
+
+  private dispatchList(): Record<string, unknown> {
+    return {
+      sessions: this.store.all().map(sessionSummary),
+    };
+  }
+
+  private dispatchGet(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const target = this.resolveSource(from, args);
+    if (!target) throw new Error("session not found in this window");
+    return sessionSummary(target);
+  }
+}
+
+function sessionSummary(s: Session): Record<string, unknown> {
+  return {
+    id: s.id,
+    displayName: s.displayName,
+    customName: s.customName,
+    directory: s.directory,
+    currentCwd: s.currentCwd,
+    claudeSessionId: s.claudeSessionId,
+    claudeVersion: s.claudeVersion,
+    parentSessionId: s.parentSessionId,
+    state: s.terminal ? s.state : "cold",
+    subagentCount: s.subagentCount,
+    lastPrompt: s.lastPrompt,
+  };
+}
+
+function writeRes(resPath: string, body: Record<string, unknown>): void {
+  try {
+    fs.writeFileSync(resPath, JSON.stringify(body));
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+function cleanupTaken(takenPath: string): void {
+  try {
+    fs.unlinkSync(takenPath);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+// ----- module-level helpers -----
+
+function generateCcId(): string {
+  return `cc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function ensureStateDir(): void {
   if (!fs.existsSync(STATE_DIR)) {
     fs.mkdirSync(STATE_DIR, { recursive: true });
   }
@@ -383,7 +1065,7 @@ function parseStateFile(filePath: string): ClaudeState {
     }
     const content = fs.readFileSync(filePath, "utf-8").trim().toUpperCase();
 
-    // Check TIMEDOUT states first (they contain PERMS/WAITING substrings)
+    // TIMEDOUT-* must come before PERMS/WAITING since they contain substrings
     if (content.includes("TIMEDOUT-PERMS")) {
       return ClaudeState.TimedOutPerms;
     } else if (content.includes("TIMEDOUT-WAITING")) {
@@ -403,36 +1085,547 @@ function parseStateFile(filePath: string): ClaudeState {
   }
 }
 
+// One-time repair for sessions whose directory got overwritten by the hook
+// to a `.claude/worktrees/<name>` path. Strips back to the project root so
+// Remake can find the transcript (Claude indexes by launch cwd's project
+// hash). Idempotent — safe to apply on every restore.
+function repairWorktreeDrift(directory: string): string {
+  const marker = "/.claude/worktrees/";
+  const idx = directory.indexOf(marker);
+  if (idx < 0) return directory;
+  return directory.slice(0, idx);
+}
+
+// Generic sidecar reader. Returns undefined if the file doesn't exist or
+// can't be read. Caller decides how to interpret the trimmed content.
+function readSidecar(ccId: string, suffix: string): string | undefined {
+  const filePath = path.join(STATE_DIR, `${ccId}.${suffix}`);
+  try {
+    if (!fs.existsSync(filePath)) return undefined;
+    return fs.readFileSync(filePath, "utf-8").trim();
+  } catch (e) {
+    return undefined;
+  }
+}
+
+// TreeView provider — talks to the store, never mutates it. Drag-drop calls
+// store.reorder which handles persistence.
+class ClaudeTerminalsProvider
+  implements
+    vscode.TreeDataProvider<Session>,
+    vscode.TreeDragAndDropController<Session>
+{
+  private _onDidChangeTreeData = new vscode.EventEmitter<Session | undefined>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  readonly dropMimeTypes = ["application/vnd.code.tree.claudeterminals"];
+  readonly dragMimeTypes = ["application/vnd.code.tree.claudeterminals"];
+
+  constructor(private readonly store: SessionStore) {
+    store.onDidChange(() => this._onDidChangeTreeData.fire(undefined));
+  }
+
+  refresh(): void {
+    this._onDidChangeTreeData.fire(undefined);
+  }
+
+  handleDrag(
+    source: readonly Session[],
+    dataTransfer: vscode.DataTransfer,
+  ): void {
+    dataTransfer.set(
+      "application/vnd.code.tree.claudeterminals",
+      new vscode.DataTransferItem(source.map((t) => t.id)),
+    );
+  }
+
+  handleDrop(
+    target: Session | undefined,
+    dataTransfer: vscode.DataTransfer,
+  ): void {
+    const transferItem = dataTransfer.get(
+      "application/vnd.code.tree.claudeterminals",
+    );
+    if (!transferItem) return;
+    const draggedIds: string[] = transferItem.value;
+    if (!draggedIds || draggedIds.length === 0) return;
+    this.store.reorder(draggedIds[0], target?.id);
+  }
+
+  getTreeItem(session: Session): vscode.TreeItem {
+    const label =
+      session.customName || session.displayName || `Claude ${session.id.slice(-6)}`;
+
+    const item = new vscode.TreeItem(
+      label,
+      vscode.TreeItemCollapsibleState.None,
+    );
+
+    const isCold = session.terminal === undefined;
+    let statePrefix = "";
+
+    if (isCold) {
+      item.iconPath = new vscode.ThemeIcon(
+        "archive",
+        new vscode.ThemeColor("descriptionForeground"),
+      );
+      statePrefix = "❄️ cold";
+      item.contextValue = "terminal-cold";
+    } else {
+      switch (session.state) {
+        case ClaudeState.Permissions:
+          item.iconPath = new vscode.ThemeIcon(
+            "alert",
+            new vscode.ThemeColor("errorForeground"),
+          );
+          statePrefix = "🔴 PERMS";
+          item.contextValue = "terminal-perms";
+          break;
+        case ClaudeState.TimedOutPerms:
+          item.iconPath = new vscode.ThemeIcon(
+            "warning",
+            new vscode.ThemeColor("editorWarning.foreground"),
+          );
+          statePrefix = "🟠 TIMED OUT (P)";
+          item.contextValue = "terminal-warm";
+          break;
+        case ClaudeState.TimedOutWaiting:
+          item.iconPath = new vscode.ThemeIcon(
+            "warning",
+            new vscode.ThemeColor("editorWarning.foreground"),
+          );
+          statePrefix = "🟠 TIMED OUT (Q)";
+          item.contextValue = "terminal-warm";
+          break;
+        case ClaudeState.Busy:
+          item.iconPath = new vscode.ThemeIcon(
+            "sync~spin",
+            new vscode.ThemeColor("warningForeground"),
+          );
+          statePrefix = "🟡 BUSY";
+          item.contextValue = "terminal-warm";
+          break;
+        case ClaudeState.Waiting:
+          item.iconPath = new vscode.ThemeIcon(
+            "comment-discussion",
+            new vscode.ThemeColor("notificationsInfoIcon.foreground"),
+          );
+          statePrefix = "🔵 WAITING";
+          item.contextValue = "terminal-warm";
+          break;
+        case ClaudeState.Idle:
+          item.iconPath = new vscode.ThemeIcon(
+            "circle-outline",
+            new vscode.ThemeColor("testing.iconPassed"),
+          );
+          statePrefix = "🟢 idle";
+          item.contextValue = "terminal-warm";
+          break;
+        default:
+          item.iconPath = new vscode.ThemeIcon("question");
+          statePrefix = "⚪ ?";
+          item.contextValue = "terminal-warm";
+      }
+    }
+
+    const promptPreview = !isCold && session.lastPrompt
+      ? session.lastPrompt.slice(0, 50) +
+        (session.lastPrompt.length > 50 ? "..." : "")
+      : "";
+    const subagentBadge =
+      !isCold && session.subagentCount > 0
+        ? ` · ${session.subagentCount} sub`
+        : "";
+    item.description = `${statePrefix}${subagentBadge}${promptPreview ? " · " + promptPreview : ""}`;
+
+    // Tooltip — markdown, one piece of info per line. Cold rendering omits
+    // live fields (state already shows "❄️ cold").
+    const md = new vscode.MarkdownString();
+    md.appendMarkdown(`**${label}**\n\n`);
+    md.appendMarkdown(`**State:** ${statePrefix}`);
+    if (!isCold && session.subagentCount > 0) {
+      md.appendMarkdown(` · ${session.subagentCount} subagent${session.subagentCount === 1 ? "" : "s"}`);
+    }
+    md.appendMarkdown(`\n\n`);
+    md.appendMarkdown(`**Directory:** \`${session.directory}\`\n\n`);
+    if (
+      !isCold &&
+      session.currentCwd &&
+      session.currentCwd !== session.directory
+    ) {
+      md.appendMarkdown(`**Now in:** \`${session.currentCwd}\`\n\n`);
+    }
+    if (session.claudeSessionId || session.claudeVersion) {
+      const v = session.claudeVersion ? session.claudeVersion.replace(/\s*\(Claude Code\)\s*$/, "") : undefined;
+      const sidTail = session.claudeSessionId
+        ? session.claudeSessionId.slice(-8)
+        : undefined;
+      const claudeParts: string[] = [];
+      if (v) claudeParts.push(v);
+      if (sidTail) claudeParts.push(`session …${sidTail}`);
+      md.appendMarkdown(`**Claude:** ${claudeParts.join(" · ")}\n\n`);
+    }
+    if (session.parentDisplayName) {
+      md.appendMarkdown(`**Forked from:** ${session.parentDisplayName}\n\n`);
+    }
+    if (!isCold && session.lastPrompt) {
+      md.appendMarkdown(`**Last prompt:** ${session.lastPrompt}\n\n`);
+    }
+    md.appendMarkdown(
+      isCold
+        ? `*Right-click → Remake to revive*`
+        : `*Click to focus · right-click for actions*`,
+    );
+    item.tooltip = md;
+
+    // Cold sessions: clicking the row opens the settings dialog (Phase 5)
+    // — for now, just no-op the click rather than try to focus a missing
+    // terminal. Warm: click focuses.
+    if (!isCold) {
+      item.command = {
+        command: "claudeCodeStatus.focusTerminal",
+        title: "Focus Terminal",
+        arguments: [session],
+      };
+    }
+
+    return item;
+  }
+
+  // Phase 3: tree shows all sessions including cold.
+  getChildren(): Session[] {
+    return store.all();
+  }
+}
+
+// SessionEditorPanel — webview dialog for editing a session's name and
+// directory together, with read-only context (ccId, Claude session id,
+// version, lineage, createdAt) visible alongside. Replaces the
+// single-field rename input box.
+//
+// Singleton: at most one panel open at a time. Re-invoking on a different
+// session updates the existing panel.
+class SessionEditorPanel {
+  private static currentPanel: SessionEditorPanel | undefined;
+  private readonly panel: vscode.WebviewPanel;
+  private session: Session;
+  private disposed = false;
+
+  static show(store: SessionStore, session: Session): void {
+    if (SessionEditorPanel.currentPanel) {
+      SessionEditorPanel.currentPanel.update(session);
+      SessionEditorPanel.currentPanel.panel.reveal();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "claudeSessionEditor",
+      "Edit Session",
+      vscode.ViewColumn.Beside,
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    SessionEditorPanel.currentPanel = new SessionEditorPanel(
+      panel,
+      store,
+      session,
+    );
+  }
+
+  private constructor(
+    panel: vscode.WebviewPanel,
+    private readonly store: SessionStore,
+    session: Session,
+  ) {
+    this.panel = panel;
+    this.session = session;
+    this.panel.title = `Edit: ${session.customName || session.displayName}`;
+    this.panel.webview.html = this.renderHtml();
+
+    this.panel.webview.onDidReceiveMessage(async (msg) => {
+      if (this.disposed) return;
+      switch (msg.type) {
+        case "browse":
+          await this.handleBrowse();
+          break;
+        case "save":
+          this.applyPatch(msg.patch || {});
+          this.panel.dispose();
+          break;
+        case "saveAndRemake":
+          this.applyPatch(msg.patch || {});
+          this.store.remake(this.session.id);
+          this.panel.dispose();
+          break;
+        case "cancel":
+          this.panel.dispose();
+          break;
+      }
+    });
+
+    this.panel.onDidDispose(() => {
+      this.disposed = true;
+      SessionEditorPanel.currentPanel = undefined;
+    });
+  }
+
+  private update(session: Session): void {
+    this.session = session;
+    this.panel.title = `Edit: ${session.customName || session.displayName}`;
+    this.panel.webview.html = this.renderHtml();
+  }
+
+  private async handleBrowse(): Promise<void> {
+    const result = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      defaultUri: vscode.Uri.file(this.session.directory),
+      openLabel: "Select directory",
+    });
+    if (result && result[0]) {
+      this.panel.webview.postMessage({
+        type: "dirSelected",
+        dir: result[0].fsPath,
+      });
+    }
+  }
+
+  private applyPatch(patch: { customName?: string; directory?: string }): void {
+    const update: Partial<PersistedSession> = {};
+    const newName = (patch.customName ?? "").trim();
+    if (newName !== (this.session.customName || "")) {
+      update.customName = newName || undefined;
+    }
+    if (
+      patch.directory &&
+      patch.directory !== this.session.directory
+    ) {
+      update.directory = patch.directory;
+    }
+    if (Object.keys(update).length > 0) {
+      this.store.update(this.session.id, update);
+    }
+    // Send /rename to the live terminal if remote-control is on and the
+    // name actually changed. Same behavior as the legacy rename command.
+    if (
+      update.customName !== undefined &&
+      this.session.terminal &&
+      vscode.workspace
+        .getConfiguration("claudeCodeStatus")
+        .get<boolean>("remoteControl", false)
+    ) {
+      this.session.terminal.sendText(`/rename ${update.customName}`);
+    }
+  }
+
+  private renderHtml(): string {
+    const s = this.session;
+    const cs = s.claudeSessionId || "";
+    const cv = (s.claudeVersion || "").replace(/\s*\(Claude Code\)\s*$/, "");
+    const created = s.createdAt
+      ? new Date(s.createdAt).toLocaleString()
+      : "";
+    const parent = s.parentDisplayName || "";
+    const esc = htmlEscape;
+
+    const optionalRow = (label: string, value: string): string =>
+      value
+        ? `<div class="form-row">
+             <label>${esc(label)}</label>
+             <div class="readonly">${esc(value)}</div>
+             <span></span>
+           </div>`
+        : "";
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<style>
+  body {
+    font-family: var(--vscode-font-family);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    padding: 24px;
+    max-width: 640px;
+  }
+  h2 { margin-top: 0; font-weight: 400; }
+  .form-row {
+    display: grid;
+    grid-template-columns: 140px 1fr auto;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .form-row label { color: var(--vscode-descriptionForeground); }
+  input[type="text"] {
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, transparent);
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: inherit;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  input[type="text"]:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+  }
+  button {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: 1px solid var(--vscode-button-border, transparent);
+    padding: 6px 14px;
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+  }
+  button:hover { background: var(--vscode-button-hoverBackground); }
+  button.secondary {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+  }
+  button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  hr {
+    border: 0;
+    border-top: 1px solid var(--vscode-panel-border);
+    margin: 20px 0;
+  }
+  .readonly {
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.9em;
+    user-select: all;
+  }
+  .actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 28px;
+  }
+  .actions .left { margin-right: auto; }
+</style>
+</head>
+<body>
+  <h2>Edit Session</h2>
+
+  <div class="form-row">
+    <label for="name">Name</label>
+    <input id="name" type="text" value="${esc(s.customName || "")}" placeholder="${esc(s.displayName)}" autofocus />
+    <span></span>
+  </div>
+
+  <div class="form-row">
+    <label for="dir">Directory</label>
+    <input id="dir" type="text" value="${esc(s.directory)}" />
+    <button class="secondary" onclick="browse()">Browse…</button>
+  </div>
+
+  <hr/>
+
+  <div class="form-row">
+    <label>ccId</label>
+    <div class="readonly">${esc(s.id)}</div>
+    <span></span>
+  </div>
+  ${optionalRow("Claude session", cs)}
+  ${optionalRow("Claude version", cv)}
+  ${optionalRow("Forked from", parent)}
+  <div class="form-row">
+    <label>Created</label>
+    <div class="readonly">${esc(created)}</div>
+    <span></span>
+  </div>
+
+  <div class="actions">
+    <button class="secondary left" onclick="cancel()">Cancel</button>
+    <button onclick="save(false)">Save</button>
+    <button onclick="save(true)">Save &amp; Remake</button>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    function patch() {
+      return {
+        customName: document.getElementById('name').value,
+        directory: document.getElementById('dir').value,
+      };
+    }
+    function save(remake) {
+      vscode.postMessage({ type: remake ? 'saveAndRemake' : 'save', patch: patch() });
+    }
+    function browse() { vscode.postMessage({ type: 'browse' }); }
+    function cancel() { vscode.postMessage({ type: 'cancel' }); }
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') cancel();
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) save(false);
+    });
+    window.addEventListener('message', (e) => {
+      const msg = e.data;
+      if (msg.type === 'dirSelected') {
+        document.getElementById('dir').value = msg.dir;
+      }
+    });
+  </script>
+</body>
+</html>`;
+  }
+}
+
+function htmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// ----- module globals -----
+
+let store: SessionStore;
+let claudeTerminalsProvider: ClaudeTerminalsProvider;
+let statusBarItem: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
+let commandChannel: CommandChannel;
+
+function log(msg: string): void {
+  const debug = vscode.workspace
+    .getConfiguration("claudeCodeStatus")
+    .get("debug");
+  if (debug && outputChannel) {
+    outputChannel.appendLine(`[${new Date().toISOString()}] ${msg}`);
+  }
+}
+
 function updateStatusBar(): void {
-  // Refresh tree view
-  if (claudeTerminalsProvider) {
-    claudeTerminalsProvider.refresh();
-  }
+  if (!statusBarItem) return;
 
-  // Guard against early calls before statusBarItem is created
-  if (!statusBarItem) {
-    return;
-  }
+  const all = store.all();
+  const warm = all.filter((s) => s.terminal !== undefined);
+  const coldCount = all.length - warm.length;
 
-  const terminals = Array.from(trackedTerminals.values());
-
-  if (terminals.length === 0) {
+  if (warm.length === 0 && coldCount === 0) {
     statusBarItem.hide();
     return;
   }
 
   const stateCounts: Record<string, number> = {};
-  for (const t of terminals) {
-    const config = STATE_CONFIG[t.state];
+  for (const s of warm) {
+    const config = STATE_CONFIG[s.state];
     stateCounts[config.label] = (stateCounts[config.label] || 0) + 1;
   }
 
   const parts = Object.entries(stateCounts).map(([label, count]) =>
     count > 1 ? `${label}(${count})` : label,
   );
+  // Cold sessions get their own count, separate from warm-state aggregation.
+  // They don't drive the urgency color below.
+  if (coldCount > 0) {
+    parts.push(`❄️(${coldCount})`);
+  }
 
-  const hasPerms = terminals.some((t) => t.state === ClaudeState.Permissions);
-  const hasBusy = terminals.some((t) => t.state === ClaudeState.Busy);
+  const hasPerms = warm.some((s) => s.state === ClaudeState.Permissions);
+  const hasBusy = warm.some((s) => s.state === ClaudeState.Busy);
 
   if (hasPerms) {
     statusBarItem.backgroundColor = new vscode.ThemeColor(
@@ -454,209 +1647,17 @@ function updateStatusBar(): void {
   }
 
   statusBarItem.text = `$(terminal) CC: ${parts.join(", ")}`;
-  statusBarItem.tooltip = `Claude Code: ${terminals.length} terminal(s)\nClick to show`;
+  const tooltipLine =
+    coldCount > 0
+      ? `${warm.length} warm + ${coldCount} cold`
+      : `${warm.length} terminal(s)`;
+  statusBarItem.tooltip = `Claude Code: ${tooltipLine}\nClick to show`;
   statusBarItem.show();
 }
 
-function readPromptFile(stateFile: string): string | undefined {
-  const promptFile = stateFile.replace(".state", ".prompt");
-  try {
-    if (fs.existsSync(promptFile)) {
-      return fs.readFileSync(promptFile, "utf-8").trim();
-    }
-  } catch (e) {
-    // Ignore read errors
-  }
-  return undefined;
-}
+// ----- activation / deactivation -----
 
-function watchStateFile(tracked: TrackedTerminal) {
-  // Poll the state file for changes
-  const pollInterval = setInterval(() => {
-    if (!trackedTerminals.has(tracked.ccId)) {
-      clearInterval(pollInterval);
-      return;
-    }
-
-    const newState = parseStateFile(tracked.stateFile);
-    const newPrompt = readPromptFile(tracked.stateFile);
-    const now = Date.now();
-
-    // Update prompt if changed - this also signals user has typed something
-    if (newPrompt && newPrompt !== tracked.lastPrompt) {
-      tracked.lastPrompt = newPrompt;
-      tracked.hasUserInput = true;
-    }
-
-    // Handle PERMS/WAITING timeout - since Claude hooks don't always fire on dismiss,
-    // we auto-transition to TIMED OUT after a configurable timeout
-    if (
-      tracked.state === ClaudeState.Permissions ||
-      tracked.state === ClaudeState.Waiting
-    ) {
-      const timeoutSeconds = vscode.workspace
-        .getConfiguration("claudeCodeStatus")
-        .get<number>("permsTimeout", 60);
-      if (
-        tracked.permsEnteredAt &&
-        now - tracked.permsEnteredAt > timeoutSeconds * 1000
-      ) {
-        const wasPerms = tracked.state === ClaudeState.Permissions;
-        const newState = wasPerms
-          ? ClaudeState.TimedOutPerms
-          : ClaudeState.TimedOutWaiting;
-        const stateFile = wasPerms ? "TIMEDOUT-PERMS" : "TIMEDOUT-WAITING";
-
-        log(
-          `${tracked.state} timeout for ${tracked.ccId} after ${timeoutSeconds}s, marking ${stateFile}`,
-        );
-        tracked.state = newState;
-        tracked.permsEnteredAt = undefined;
-        // Write state to file so it stays consistent
-        try {
-          fs.writeFileSync(tracked.stateFile, `${stateFile}\n`);
-        } catch (e) {
-          // Ignore write errors
-        }
-        updateStatusBar();
-        return;
-      }
-    }
-
-    if (newState !== tracked.state) {
-      // Ignore BUSY until user has actually typed something
-      // Claude runs startup tools (git status, Glob, etc.) which is just noise
-      if (!tracked.hasUserInput && newState === ClaudeState.Busy) {
-        log(`Ignoring BUSY before user input for ${tracked.ccId}`);
-        return;
-      }
-
-      log(`State change for ${tracked.ccId}: ${tracked.state} -> ${newState}`);
-
-      // Track when we enter PERMS or WAITING state (both need timeout tracking)
-      if (
-        newState === ClaudeState.Permissions ||
-        newState === ClaudeState.Waiting
-      ) {
-        tracked.permsEnteredAt = now;
-      } else {
-        tracked.permsEnteredAt = undefined;
-      }
-
-      tracked.state = newState;
-      updateStatusBar();
-    }
-  }, 100); // Poll every 100ms for responsiveness
-
-  tracked.pollInterval = pollInterval;
-}
-
-function generateCcId(): string {
-  return `cc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function adoptTerminal(terminal: vscode.Terminal): TrackedTerminal {
-  ensureStateDir();
-
-  const ccId = generateCcId();
-  const stateFile = path.join(STATE_DIR, `${ccId}.state`);
-
-  // Write initial state as unknown (we don't know Claude's current state)
-  fs.writeFileSync(stateFile, "IDLE\n");
-
-  // Inject the env var into the terminal
-  // This sets it for future commands in this shell session
-  terminal.sendText(`export VSCODE_CC_ID=${ccId}`, true);
-
-  const tracked: TrackedTerminal = {
-    terminal,
-    ccId,
-    stateFile,
-    state: ClaudeState.Idle,
-    hasUserInput: false,
-  };
-
-  trackedTerminals.set(ccId, tracked);
-  watchStateFile(tracked);
-  updateStatusBar();
-  saveState();
-
-  log(`Adopted terminal "${terminal.name}" with VSCODE_CC_ID=${ccId}`);
-  vscode.window.showInformationMessage(
-    `Terminal adopted. Future Claude hook events will now be tracked.`,
-  );
-
-  terminal.show();
-  return tracked;
-}
-
-function createClaudeTerminal(
-  args: string[] = [],
-): TrackedTerminal | undefined {
-  ensureStateDir();
-
-  const ccId = generateCcId();
-  const stateFile = path.join(STATE_DIR, `${ccId}.state`);
-
-  // Write initial state
-  fs.writeFileSync(stateFile, "IDLE\n");
-
-  const workspaceFolder =
-    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
-
-  // Build command: configurable program + explicit args + user-configured extra args
-  const config = vscode.workspace.getConfiguration("claudeCodeStatus");
-  const command = config.get<string>("command", "claude");
-  const extraArgs = config.get<string[]>("extraArgs", []);
-  const remoteControl = config.get<boolean>("remoteControl", false);
-
-  const now = new Date();
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
-  const sessionName = `s:${hh}:${mm}:${ss}`;
-  const shortId = sessionName;
-
-  const allArgs = [...args, ...extraArgs];
-  if (remoteControl) {
-    allArgs.push("--remote-control");
-  }
-  // Build command string, quoting the session name separately
-  let claudeArgs = allArgs.length > 0 ? " " + allArgs.join(" ") : "";
-  if (remoteControl) {
-    claudeArgs += ` -n "${sessionName}"`;
-  }
-  const terminal = vscode.window.createTerminal({
-    name: `CC: idle [${shortId}]`,
-    cwd: workspaceFolder,
-    env: {
-      VSCODE_CC_ID: ccId, // This is read by the hook script
-    },
-  });
-
-  const tracked: TrackedTerminal = {
-    terminal,
-    ccId,
-    stateFile,
-    state: ClaudeState.Idle,
-    hasUserInput: false,
-    displayName: sessionName,
-  };
-
-  trackedTerminals.set(ccId, tracked);
-  watchStateFile(tracked);
-  saveState();
-
-  // Send the command to run claude
-  terminal.sendText(`${command}${claudeArgs}`);
-
-  log(`Created terminal with VSCODE_CC_ID=${ccId}`);
-
-  return tracked;
-}
-
-export function activate(context: vscode.ExtensionContext) {
-  extensionContext = context;
+export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel("Claude Code Status");
 
   const enabled = vscode.workspace
@@ -673,11 +1674,13 @@ export function activate(context: vscode.ExtensionContext) {
     "Make sure Claude Code hooks are configured in ~/.claude/settings.json",
   );
 
+  store = new SessionStore(context);
+
   try {
     ensureStateDir();
 
-    // Restore terminals from previous session - delay to let VS Code populate terminal names
-    // Retry a few times since terminal names may take a while to populate
+    // Restore — retry up to 5x500ms since terminal names take a moment to
+    // populate after reload.
     const tryRestore = (attempt: number) => {
       try {
         const terminalNames = vscode.window.terminals
@@ -688,7 +1691,8 @@ export function activate(context: vscode.ExtensionContext) {
           setTimeout(() => tryRestore(attempt + 1), 500);
           return;
         }
-        restoreState();
+        store.restore();
+        updateStatusBar();
       } catch (e) {
         outputChannel.appendLine(`Error during restore: ${e}`);
       }
@@ -698,8 +1702,7 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(`Error during initialization: ${e}`);
   }
 
-  // Create TreeView for Claude terminals
-  claudeTerminalsProvider = new ClaudeTerminalsProvider();
+  claudeTerminalsProvider = new ClaudeTerminalsProvider(store);
   const treeView = vscode.window.createTreeView("claudeTerminals", {
     treeDataProvider: claudeTerminalsProvider,
     showCollapseAll: false,
@@ -708,50 +1711,87 @@ export function activate(context: vscode.ExtensionContext) {
   });
   context.subscriptions.push(treeView);
 
-  // Focus terminal command (for tree item click)
-  const focusTerminalCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.focusTerminal",
-    (tracked: TrackedTerminal) => {
-      tracked.terminal.show();
-    },
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.focusTerminal",
+      (session: Session) => {
+        session.terminal?.show();
+      },
+    ),
   );
-  context.subscriptions.push(focusTerminalCmd);
 
-  // Close terminal command
-  const closeTerminalCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.closeTerminal",
-    (tracked: TrackedTerminal) => {
-      tracked.terminal.dispose();
-      // Cleanup happens via onDidCloseTerminal handler
-    },
+  // Suspend — terminal dies, session record stays as cold. The inline
+  // "pause" icon and right-click "Suspend" both call this. The legacy
+  // closeTerminal command id is kept as an alias for backwards compat
+  // (any keybinding the user set up still works).
+  const suspendHandler = (session: Session) => {
+    store.suspend(session.id);
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeCodeStatus.suspend", suspendHandler),
   );
-  context.subscriptions.push(closeTerminalCmd);
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.closeTerminal",
+      suspendHandler,
+    ),
+  );
 
-  // Rename terminal command
-  const renameTerminalCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.renameTerminal",
-    async (tracked: TrackedTerminal) => {
-      const name = await vscode.window.showInputBox({
-        prompt: "Enter a name for this Claude terminal",
-        value: tracked.customName || "",
-      });
-      if (name !== undefined) {
-        tracked.customName = name || undefined;
-        // If remote control is on, rename the Claude session to match
-        if (
-          name &&
-          vscode.workspace
-            .getConfiguration("claudeCodeStatus")
-            .get<boolean>("remoteControl", false)
-        ) {
-          tracked.terminal.sendText(`/rename ${name}`);
+  // Remake — kill the old terminal, start a fresh claude with --resume
+  // pointing at the same conversation. Works on warm AND cold sessions.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.remakeTerminal",
+      (session: Session) => {
+        store.remake(session.id);
+        updateStatusBar();
+      },
+    ),
+  );
+
+  // Delete — drops the panel record + all sidecars. The Claude transcript
+  // file stays on disk (reachable by `claude --resume <id>` if you have
+  // the id). Modal confirmation by default; flip claudeCodeStatus.confirmDelete
+  // off to one-click delete.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.delete",
+      async (session: Session) => {
+        const confirm = vscode.workspace
+          .getConfiguration("claudeCodeStatus")
+          .get<boolean>("confirmDelete", true);
+        if (confirm) {
+          const name = session.customName || session.displayName;
+          const choice = await vscode.window.showWarningMessage(
+            `Delete session "${name}"?`,
+            { modal: true, detail: "Removes the panel record and sidecar files. The Claude conversation transcript stays on disk." },
+            "Delete",
+          );
+          if (choice !== "Delete") return;
         }
-        claudeTerminalsProvider.refresh();
-        saveState();
-      }
-    },
+        store.delete(session.id);
+        updateStatusBar();
+      },
+    ),
   );
-  context.subscriptions.push(renameTerminalCmd);
+
+  // Edit Session — opens the SessionEditorPanel webview. Replaces the
+  // single-field rename input box; renameTerminal is kept as an alias so
+  // any existing custom keybindings keep working.
+  const openEditor = (session: Session) =>
+    SessionEditorPanel.show(store, session);
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.editSession",
+      openEditor,
+    ),
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.renameTerminal",
+      openEditor,
+    ),
+  );
 
   statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -760,220 +1800,230 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.command = "claudeCodeStatus.showTerminals";
   context.subscriptions.push(statusBarItem);
 
-  // New Claude Code terminal
-  const createTerminalCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.newTerminal",
-    () => {
-      const tracked = createClaudeTerminal();
-      if (tracked) {
-        tracked.terminal.show();
-        updateStatusBar();
-      }
-    },
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeCodeStatus.newTerminal", () => {
+      const session = store.create();
+      session?.terminal?.show();
+      updateStatusBar();
+    }),
   );
-  context.subscriptions.push(createTerminalCmd);
 
-  // New terminal with --resume
-  const resumeTerminalCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.newTerminalResume",
-    () => {
-      const tracked = createClaudeTerminal(["--resume"]);
-      if (tracked) {
-        tracked.terminal.show();
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.newTerminalResume",
+      () => {
+        const session = store.create({ resume: true });
+        session?.terminal?.show();
         updateStatusBar();
-      }
-    },
+      },
+    ),
   );
-  context.subscriptions.push(resumeTerminalCmd);
 
-  // Terminal picker - shows ALL terminals, tracked ones have state info
-  const showTerminalsCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.showTerminals",
-    async () => {
-      const allTerminals = vscode.window.terminals;
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.showTerminals",
+      async () => {
+        const allTerminals = vscode.window.terminals;
 
-      if (allTerminals.length === 0) {
-        const choice = await vscode.window.showInformationMessage(
-          "No terminals open. Create a Claude Code terminal?",
-          "New Terminal",
-          "New (Resume)",
-        );
-        if (choice === "New Terminal") {
-          vscode.commands.executeCommand("claudeCodeStatus.newTerminal");
-        } else if (choice === "New (Resume)") {
-          vscode.commands.executeCommand("claudeCodeStatus.newTerminalResume");
+        if (allTerminals.length === 0) {
+          const choice = await vscode.window.showInformationMessage(
+            "No terminals open. Create a Claude Code terminal?",
+            "New Terminal",
+            "New (Resume)",
+          );
+          if (choice === "New Terminal") {
+            vscode.commands.executeCommand("claudeCodeStatus.newTerminal");
+          } else if (choice === "New (Resume)") {
+            vscode.commands.executeCommand("claudeCodeStatus.newTerminalResume");
+          }
+          return;
         }
-        return;
-      }
 
-      // Build items for all terminals
-      interface TerminalPickItem extends vscode.QuickPickItem {
-        terminal?: vscode.Terminal;
-        tracked?: TrackedTerminal;
-        isAdoptable: boolean;
-        isNewTerminal?: boolean;
-      }
-
-      const items: TerminalPickItem[] = [];
-
-      // Add "New Terminal" options at the top
-      items.push({
-        label: "$(plus) New Claude Terminal",
-        description: "Create new tracked terminal",
-        isAdoptable: false,
-        isNewTerminal: true,
-      });
-
-      // Add existing terminals
-      allTerminals.forEach((terminal) => {
-        // Check if this terminal is tracked
-        const tracked = Array.from(trackedTerminals.values()).find(
-          (t) => t.terminal === terminal,
-        );
-
-        if (tracked) {
-          const config = STATE_CONFIG[tracked.state];
-          const needsAttention = tracked.state === ClaudeState.Permissions;
-          items.push({
-            label: `${needsAttention ? "$(alert) " : "$(terminal) "}${terminal.name}`,
-            description: config.label,
-            detail: needsAttention ? "Needs attention!" : undefined,
-            terminal,
-            tracked,
-            isAdoptable: false,
-          });
-        } else {
-          // Untracked terminal - might be Claude, might not
-          items.push({
-            label: `$(terminal) ${terminal.name}`,
-            description: "untracked",
-            detail: "Select to adopt as Claude terminal",
-            terminal,
-            isAdoptable: true,
-          });
+        interface TerminalPickItem extends vscode.QuickPickItem {
+          terminal?: vscode.Terminal;
+          session?: Session;
+          isAdoptable: boolean;
+          isNewTerminal?: boolean;
         }
-      });
 
-      // Sort: New Terminal first, then PERMS, then tracked by priority, then untracked
-      items.sort((a, b) => {
-        // New Terminal always first
-        if (a.isNewTerminal) return -1;
-        if (b.isNewTerminal) return 1;
-        // Then by state priority
-        const aPriority = a.tracked
-          ? STATE_CONFIG[a.tracked.state].priority
-          : -1;
-        const bPriority = b.tracked
-          ? STATE_CONFIG[b.tracked.state].priority
-          : -1;
-        return bPriority - aPriority;
-      });
+        const items: TerminalPickItem[] = [];
 
-      const selected = await vscode.window.showQuickPick(items, {
-        placeHolder: "Select a terminal (untracked terminals can be adopted)",
-      });
+        items.push({
+          label: "$(plus) New Claude Terminal",
+          description: "Create new tracked terminal",
+          isAdoptable: false,
+          isNewTerminal: true,
+        });
 
-      if (selected) {
+        allTerminals.forEach((terminal) => {
+          const session = store
+            .all()
+            .find((s) => s.terminal === terminal);
+          if (session) {
+            const config = STATE_CONFIG[session.state];
+            const needsAttention = session.state === ClaudeState.Permissions;
+            items.push({
+              label: `${needsAttention ? "$(alert) " : "$(terminal) "}${terminal.name}`,
+              description: config.label,
+              detail: needsAttention ? "Needs attention!" : undefined,
+              terminal,
+              session,
+              isAdoptable: false,
+            });
+          } else {
+            items.push({
+              label: `$(terminal) ${terminal.name}`,
+              description: "untracked",
+              detail: "Select to adopt as Claude terminal",
+              terminal,
+              isAdoptable: true,
+            });
+          }
+        });
+
+        items.sort((a, b) => {
+          if (a.isNewTerminal) return -1;
+          if (b.isNewTerminal) return 1;
+          const aPriority = a.session
+            ? STATE_CONFIG[a.session.state].priority
+            : -1;
+          const bPriority = b.session
+            ? STATE_CONFIG[b.session.state].priority
+            : -1;
+          return bPriority - aPriority;
+        });
+
+        const selected = await vscode.window.showQuickPick(items, {
+          placeHolder: "Select a terminal (untracked terminals can be adopted)",
+        });
+
+        if (!selected) return;
         if (selected.isNewTerminal) {
-          // Create new tracked terminal
           vscode.commands.executeCommand("claudeCodeStatus.newTerminal");
         } else if (selected.isAdoptable && selected.terminal) {
-          // Offer to adopt this terminal
           const adopt = await vscode.window.showInformationMessage(
             `Adopt "${selected.terminal.name}" as a Claude Code terminal?`,
             "Adopt",
             "Just Show",
           );
           if (adopt === "Adopt") {
-            adoptTerminal(selected.terminal);
+            const adopted = store.adopt(selected.terminal);
+            adopted.terminal?.show();
+            updateStatusBar();
           } else {
             selected.terminal.show();
           }
         } else if (selected.terminal) {
           selected.terminal.show();
         }
-      }
-    },
+      },
+    ),
   );
-  context.subscriptions.push(showTerminalsCmd);
 
-  // Show setup instructions
-  const showSetupCmd = vscode.commands.registerCommand(
-    "claudeCodeStatus.showSetup",
-    () => {
-      outputChannel.show();
-      outputChannel.appendLine("\n=== SETUP INSTRUCTIONS ===");
-      outputChannel.appendLine("Add this to your ~/.claude/settings.json:");
-      outputChannel.appendLine(
-        JSON.stringify(
-          {
-            hooks: {
-              PreToolUse: [{ type: "command", command: getHookScriptPath() }],
-              PostToolUse: [{ type: "command", command: getHookScriptPath() }],
-              PermissionRequest: [
-                { type: "command", command: getHookScriptPath() },
-              ],
-              Stop: [{ type: "command", command: getHookScriptPath() }],
-              UserPromptSubmit: [
-                { type: "command", command: getHookScriptPath() },
-              ],
-              SessionStart: [{ type: "command", command: getHookScriptPath() }],
-              SessionEnd: [{ type: "command", command: getHookScriptPath() }],
-            },
-          },
-          null,
-          2,
-        ),
-      );
-    },
-  );
-  context.subscriptions.push(showSetupCmd);
-
-  // Terminal lifecycle
+  // New sibling — fresh Claude in the source session's directory. The
+  // name prompt is genuinely optional: Escape or empty input both proceed
+  // with an auto-generated name. (Previously Escape cancelled, which was
+  // surprising — you'd click New Sibling, see a prompt, dismiss it
+  // expecting "default name" semantics, and get nothing.)
   context.subscriptions.push(
-    vscode.window.onDidCloseTerminal((terminal) => {
-      // Find and remove tracked terminal
-      for (const [key, tracked] of trackedTerminals.entries()) {
-        if (tracked.terminal === terminal) {
-          // Cleanup
-          if (tracked.pollInterval) {
-            clearInterval(tracked.pollInterval);
-          }
-          try {
-            fs.unlinkSync(tracked.stateFile);
-          } catch (e) {
-            // Ignore cleanup errors
-          }
-          trackedTerminals.delete(key);
-          log(`Removed terminal: ${key}`);
-          updateStatusBar();
-          saveState();
-          break;
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.newSibling",
+      async (session: Session) => {
+        const dirName = path.basename(session.directory);
+        const name = await vscode.window.showInputBox({
+          prompt: `New sibling in ${dirName} — name (optional, Escape to use auto-name)`,
+          placeHolder: "Leave blank for an auto-generated name",
+        });
+        const newSess = store.newSibling(session.id, name || undefined);
+        newSess?.terminal?.show();
+        updateStatusBar();
+      },
+    ),
+  );
+
+  // Fork — new session resuming source's conversation via --fork-session.
+  // Busy confirm is the real commitment gate. The follow-up name prompt
+  // is genuinely optional — Escape proceeds with auto-name.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.fork",
+      async (session: Session) => {
+        if (!session.claudeSessionId) {
+          vscode.window.showWarningMessage(
+            `Cannot fork "${session.customName || session.displayName}" — no Claude session id captured yet.`,
+          );
+          return;
         }
+        if (session.state === ClaudeState.Busy) {
+          const confirm = await vscode.window.showWarningMessage(
+            `Source session is busy — fork now anyway? The fork resumes from whatever's on disk at this moment.`,
+            "Fork",
+            "Cancel",
+          );
+          if (confirm !== "Fork") return;
+        }
+        const sourceLabel = session.customName || session.displayName;
+        const name = await vscode.window.showInputBox({
+          prompt: `Fork from "${sourceLabel}" — name (optional, Escape to use auto-name)`,
+          placeHolder: "Leave blank for an auto-generated name",
+        });
+        const newSess = store.fork(session.id, name || undefined);
+        newSess?.terminal?.show();
+        updateStatusBar();
+      },
+    ),
+  );
+
+  // Reconnect remote-control — for sessions whose --remote-control link
+  // dropped (Claude Code app disconnects, network blips). Sends /remote-control
+  // into the live terminal, which re-establishes the link.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.reconnectRemoteControl",
+      (session: Session) => {
+        store.reconnectRemoteControl(session.id);
+      },
+    ),
+  );
+
+  // Set/update the remote-control context key so package.json menus can
+  // hide the Reconnect item when the user doesn't have remote-control on.
+  const updateRemoteControlContext = () => {
+    const enabled = vscode.workspace
+      .getConfiguration("claudeCodeStatus")
+      .get<boolean>("remoteControl", false);
+    vscode.commands.executeCommand(
+      "setContext",
+      "claudeCodeStatus.remoteControlEnabled",
+      enabled,
+    );
+  };
+  updateRemoteControlContext();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("claudeCodeStatus.remoteControl")) {
+        updateRemoteControlContext();
       }
     }),
   );
 
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((terminal) => {
+      store.handleTerminalClose(terminal);
+      updateStatusBar();
+    }),
+  );
+
+  // Start the callback channel — accepts requests from the cc-status CLI
+  // (and therefore from the /cc slash command).
+  commandChannel = new CommandChannel(store);
+  commandChannel.start();
+
   outputChannel.appendLine("All commands registered successfully");
 }
 
-function getHookScriptPath(): string {
-  // Return the path to the hook script
-  // Users should update this to match their installation
-  return path.join(
-    os.homedir(),
-    "src",
-    "vscode-claude-status",
-    "scripts",
-    "cc-status-hook.sh",
-  );
-}
-
-export function deactivate() {
-  // Stop polling but DON'T delete state files - they're needed for restore after reload
-  for (const tracked of trackedTerminals.values()) {
-    if (tracked.pollInterval) {
-      clearInterval(tracked.pollInterval);
-    }
-  }
+export function deactivate(): void {
+  // Stop polling but preserve state files — they're needed for reload restore.
+  store?.stopAllPolling();
+  commandChannel?.stop();
 }

@@ -31,23 +31,59 @@
     "menus": {
       "view/item/context": [
         {
-          "command": "claudeCodeStatus.renameTerminal",
+          "command": "claudeCodeStatus.editSession",
           "when": "view == claudeTerminals",
           "group": "inline@1"
         },
         {
-          "command": "claudeCodeStatus.closeTerminal",
+          "command": "claudeCodeStatus.remakeTerminal",
           "when": "view == claudeTerminals",
           "group": "inline@2"
         },
         {
-          "command": "claudeCodeStatus.focusTerminal",
-          "when": "view == claudeTerminals"
+          "command": "claudeCodeStatus.delete",
+          "when": "view == claudeTerminals",
+          "group": "inline@3"
         },
         {
-          "command": "claudeCodeStatus.closeTerminal",
+          "command": "claudeCodeStatus.editSession",
           "when": "view == claudeTerminals",
-          "group": "2_close"
+          "group": "1_edit@1"
+        },
+        {
+          "command": "claudeCodeStatus.remakeTerminal",
+          "when": "view == claudeTerminals",
+          "group": "1_edit@2"
+        },
+        {
+          "command": "claudeCodeStatus.focusTerminal",
+          "when": "view == claudeTerminals && viewItem != terminal-cold",
+          "group": "1_edit@3"
+        },
+        {
+          "command": "claudeCodeStatus.newSibling",
+          "when": "view == claudeTerminals",
+          "group": "2_spawn@1"
+        },
+        {
+          "command": "claudeCodeStatus.fork",
+          "when": "view == claudeTerminals",
+          "group": "2_spawn@2"
+        },
+        {
+          "command": "claudeCodeStatus.reconnectRemoteControl",
+          "when": "view == claudeTerminals && viewItem != terminal-cold && claudeCodeStatus.remoteControlEnabled",
+          "group": "2_spawn@3"
+        },
+        {
+          "command": "claudeCodeStatus.suspend",
+          "when": "view == claudeTerminals && viewItem != terminal-cold",
+          "group": "9_destructive@1"
+        },
+        {
+          "command": "claudeCodeStatus.delete",
+          "when": "view == claudeTerminals",
+          "group": "9_destructive@2"
         }
       ],
       "view/title": [
@@ -79,14 +115,48 @@
         "icon": "$(terminal)"
       },
       {
-        "command": "claudeCodeStatus.renameTerminal",
-        "title": "Rename",
+        "command": "claudeCodeStatus.editSession",
+        "title": "Edit Session",
         "icon": "$(edit)"
       },
       {
-        "command": "claudeCodeStatus.closeTerminal",
-        "title": "Close Terminal",
+        "command": "claudeCodeStatus.renameTerminal",
+        "title": "Rename (alias for Edit Session)",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "claudeCodeStatus.remakeTerminal",
+        "title": "Remake",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeCodeStatus.suspend",
+        "title": "Suspend",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "claudeCodeStatus.delete",
+        "title": "Delete Session",
         "icon": "$(trash)"
+      },
+      {
+        "command": "claudeCodeStatus.closeTerminal",
+        "title": "Suspend Terminal (alias)"
+      },
+      {
+        "command": "claudeCodeStatus.newSibling",
+        "title": "New Sibling (same directory)",
+        "icon": "$(repo-clone)"
+      },
+      {
+        "command": "claudeCodeStatus.fork",
+        "title": "Fork (resume conversation in a new session)",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "claudeCodeStatus.reconnectRemoteControl",
+        "title": "Reconnect Remote Control",
+        "icon": "$(plug)"
       }
     ],
     "keybindings": [
@@ -132,6 +202,11 @@
           },
           "default": [],
           "description": "Extra arguments to pass to the claude command (e.g. [\"--model\", \"sonnet\", \"--allowedTools\", \"Bash,Read\"])"
+        },
+        "claudeCodeStatus.confirmDelete": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a confirmation dialog before deleting a session from the panel. Disable to one-click delete."
         }
       }
     }

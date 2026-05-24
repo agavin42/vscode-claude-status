@@ -544,26 +544,14 @@ class SessionStore {
       }
     }
 
-    // Fallback: any persisted entry gets matched to the first "CC:"
-    // terminal we haven't bound yet (handles cases where displayName
-    // wasn't yet populated when terminals were restored). State-file
-    // existence is no longer a gate — bindLegacyMatchedTerminal recreates
-    // it if missing.
-    if (persistedById.size > 0) {
-      const unmatchedTerminals = vscode.window.terminals.filter(
-        (t) =>
-          t.name.startsWith("CC:") &&
-          !Array.from(this.sessions.values()).some((s) => s.terminal === t),
-      );
-      for (const terminal of unmatchedTerminals) {
-        const next = persistedById.entries().next();
-        if (next.done) break;
-        const [ccId, data] = next.value;
-        this.bindLegacyMatchedTerminal(data, terminal);
-        persistedById.delete(ccId);
-        log(`Restored ${ccId} via fallback match to "${terminal.name}"`);
-      }
-    }
+    // No fallback. Persisted entries that don't match a terminal by name
+    // become cold (Phase 4). The old promiscuous fallback — "grab any
+    // unmatched CC: terminal for any unmatched persisted entry" — caused
+    // wrong-binding when an orphan terminal from a dead session was still
+    // around (e.g. claude exited but the shell stayed). Phase 2's retry
+    // loop in tryRestore handles the original race (terminal names not
+    // yet populated on reload), so this fallback is no longer earning
+    // its keep.
 
     // Phase 4: persisted entries without a matching terminal survive as
     // cold sessions. They render with ❄️ and can be remade.
@@ -1278,16 +1266,15 @@ class ClaudeTerminalsProvider
     );
     item.tooltip = md;
 
-    // Cold sessions: clicking the row opens the settings dialog (Phase 5)
-    // — for now, just no-op the click rather than try to focus a missing
-    // terminal. Warm: click focuses.
-    if (!isCold) {
-      item.command = {
-        command: "claudeCodeStatus.focusTerminal",
-        title: "Focus Terminal",
-        arguments: [session],
-      };
-    }
+    // Always wire the click to focusTerminal. For cold sessions it's a
+    // no-op (session.terminal?.show() short-circuits on undefined); the
+    // important effect is overriding VS Code's default tree-click handler
+    // which otherwise focuses whatever terminal happened to be active.
+    item.command = {
+      command: "claudeCodeStatus.focusTerminal",
+      title: "Focus Terminal",
+      arguments: [session],
+    };
 
     return item;
   }

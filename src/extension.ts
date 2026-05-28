@@ -522,25 +522,84 @@ class SessionStore {
       persistedById.set(p.id, p);
     }
 
-    log(
-      `Existing terminals: ${vscode.window.terminals.map((t) => t.name).join(", ") || "none"}`,
-    );
+    // Diagnostic: dump each terminal's name + whether its creationOptions
+    // still carries our VSCODE_CC_ID env var after reload. This is how we
+    // learn whether the env-var signal survives window reload.
+    for (const t of vscode.window.terminals) {
+      const opts = t.creationOptions as vscode.TerminalOptions;
+      const envId = opts?.env
+        ? (opts.env as Record<string, string>)["VSCODE_CC_ID"]
+        : undefined;
+      log(`  terminal "${t.name}" — creationOptions.env.VSCODE_CC_ID=${envId ?? "(none)"}`);
+    }
 
-    // Match by short-id substring in terminal name. Two passes — exact match
-    // by displayName first (more recent format), then fallback by ccId tail.
+    const boundTerminals = new Set<vscode.Terminal>();
+
+    // Pass 1 — match by VSCODE_CC_ID in creationOptions.env. This is the
+    // robust signal: it survives Claude retitling the terminal (which
+    // breaks name matching) because it's set once at creation and never
+    // changes. Only works if VS Code preserves creationOptions across
+    // reload (the diagnostic log above tells us).
     for (const terminal of vscode.window.terminals) {
+      if (boundTerminals.has(terminal)) continue;
+      const opts = terminal.creationOptions as vscode.TerminalOptions;
+      const envId = opts?.env
+        ? (opts.env as Record<string, string>)["VSCODE_CC_ID"]
+        : undefined;
+      if (envId && persistedById.has(envId)) {
+        this.bindLegacyMatchedTerminal(persistedById.get(envId)!, terminal);
+        persistedById.delete(envId);
+        boundTerminals.add(terminal);
+        log(`Matched ${envId} by creationOptions env var`);
+      }
+    }
+
+    // Pass 2 — match by the highly-specific signals in terminal.name:
+    // the displayName (an "s:HH:MM:SS" timestamp, effectively unique) or
+    // the ccId / its tail. These survive only if Claude hasn't retitled.
+    for (const terminal of vscode.window.terminals) {
+      if (boundTerminals.has(terminal)) continue;
       for (const [ccId, data] of persistedById) {
-        const displayName = data.displayName;
-        const shortId = ccId.slice(-6);
         if (
-          terminal.name.includes(displayName) ||
-          terminal.name.includes(shortId) ||
-          terminal.name.includes(ccId)
+          terminal.name.includes(data.displayName) ||
+          terminal.name.includes(ccId) ||
+          terminal.name.includes(ccId.slice(-6))
         ) {
           this.bindLegacyMatchedTerminal(data, terminal);
           persistedById.delete(ccId);
+          boundTerminals.add(terminal);
+          log(`Matched ${ccId} by name "${terminal.name}"`);
           break;
         }
+      }
+    }
+
+    // Pass 3 — match by customName. When a session is launched/renamed with
+    // --remote-control -n "<name>", Claude sets the terminal title to that
+    // name, so terminal.name becomes the customName (sometimes with a status
+    // prefix/suffix). Exact match first, then a contains check. Exact-first
+    // avoids a short name like "pr" grabbing "pr-tools".
+    const remaining = Array.from(persistedById.values()).filter(
+      (d) => d.customName,
+    );
+    for (const data of remaining) {
+      // exact
+      const exact = vscode.window.terminals.find(
+        (t) => !boundTerminals.has(t) && t.name === data.customName,
+      );
+      const hit =
+        exact ||
+        vscode.window.terminals.find(
+          (t) =>
+            !boundTerminals.has(t) &&
+            data.customName !== undefined &&
+            t.name.includes(data.customName),
+        );
+      if (hit) {
+        this.bindLegacyMatchedTerminal(data, hit);
+        persistedById.delete(data.id);
+        boundTerminals.add(hit);
+        log(`Matched ${data.id} by customName "${data.customName}" → "${hit.name}"`);
       }
     }
 

@@ -1603,7 +1603,15 @@ class SessionEditorPanel {
     function cancel() { vscode.postMessage({ type: 'cancel' }); }
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') cancel();
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) save(false);
+      // Plain Enter in either text field saves — the common rename flow is
+      // "type name, hit return". Cmd/Ctrl+Enter also works from anywhere.
+      if (e.key === 'Enter') {
+        const tag = (e.target && e.target.tagName) || '';
+        if (tag === 'INPUT' || e.metaKey || e.ctrlKey) {
+          e.preventDefault();
+          save(false);
+        }
+      }
     });
     window.addEventListener('message', (e) => {
       const msg = e.data;

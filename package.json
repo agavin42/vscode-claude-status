@@ -207,6 +207,12 @@
           "type": "boolean",
           "default": true,
           "description": "Show a confirmation dialog before deleting a session from the panel. Disable to one-click delete."
+        },
+        "claudeCodeStatus.busyTimeout": {
+          "type": "number",
+          "default": 150,
+          "minimum": 0,
+          "description": "Seconds a session may sit in BUSY with no hook events and a quiet transcript before it's recovered to idle. Catches turns that ended without a Stop event (Esc interrupt fires no hook; crashes/kills miss Stop). A tool call in flight is never force-idled regardless. Set to 0 to disable."
         }
       }
     }
@@ -215,7 +221,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "test": "tsc -p ./ && node --test \"out/**/*.test.js\""
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

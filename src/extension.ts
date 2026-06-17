@@ -15,6 +15,7 @@ import { isTerminalForPolling } from "./pr/status";
 import {
   DetectedPr,
   extractPrUrls,
+  parsePrRef,
   scanTranscriptForCreatedPrs,
 } from "./pr/detect";
 import { GH_PR_VIEW_FIELDS, mapGhJsonToFacts } from "./pr/github";
@@ -23,6 +24,12 @@ import {
   GithubFactsUpdate,
   upsertPrCheckpoint,
 } from "./pr/apply";
+import {
+  buildRenderModel,
+  LiveStateView,
+  RenderModel,
+  RenderSessionInput,
+} from "./pr/render";
 
 // Terminal state enum
 enum ClaudeState {
@@ -1223,6 +1230,9 @@ class CommandChannel {
         case "get":
           result = this.dispatchGet(from, args);
           break;
+        case "pr-status":
+          result = this.dispatchPrStatus(from, args);
+          break;
         default:
           writeRes(resPath, { ok: false, error: `unknown cmd: ${cmd}` });
           cleanupTaken(takenPath);
@@ -1336,6 +1346,41 @@ class CommandChannel {
     const target = this.resolveSource(from, args);
     if (!target) throw new Error("session not found in this window");
     return sessionSummary(target);
+  }
+
+  // pr-status — a session (typically running the shipit skill) reports a PR's
+  // workflow checkpoint. Self-targets via `from` ($VSCODE_CC_ID) through the
+  // same resolveSource path. Tolerantly creates the PR if not tied yet.
+  private dispatchPrStatus(
+    from: string | undefined,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const target = this.resolveSource(from, args);
+    if (!target) throw new Error("session not found in this window");
+    const url = typeof args.pr === "string" ? args.pr : undefined;
+    if (!url) throw new Error("missing --pr");
+    const checkpointRaw =
+      typeof args.checkpoint === "string" ? args.checkpoint : undefined;
+    const checkpoint = (Object.values(PrCheckpoint) as string[]).includes(
+      checkpointRaw ?? "",
+    )
+      ? (checkpointRaw as PrCheckpoint)
+      : undefined;
+    if (!checkpoint) {
+      throw new Error(
+        `invalid --checkpoint (expected one of ${Object.values(PrCheckpoint).join(", ")})`,
+      );
+    }
+    const stage =
+      typeof args.stage === "string" ? parseInt(args.stage, 10) : undefined;
+    const pr = this.store.setPrCheckpoint(
+      target.id,
+      url,
+      checkpoint,
+      Number.isNaN(stage as number) ? undefined : stage,
+    );
+    if (!pr) throw new Error("could not set PR checkpoint (bad URL?)");
+    return { sessionId: target.id, url: pr.url, checkpoint: pr.checkpoint };
   }
 }
 
@@ -2071,6 +2116,393 @@ function htmlEscape(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+// Present a session's live state for the dashboard, mirroring the tree's
+// vocabulary (sessionTreeItem) + the cold case (terminal === undefined).
+function liveStateView(session: Session): LiveStateView {
+  if (session.terminal === undefined) {
+    return { label: "cold", dot: "❄️", cold: true };
+  }
+  switch (session.state) {
+    case ClaudeState.Permissions:
+      return { label: "PERMS", dot: "🔴", cold: false };
+    case ClaudeState.TimedOutPerms:
+      return { label: "TIMED OUT (P)", dot: "🟠", cold: false };
+    case ClaudeState.TimedOutWaiting:
+      return { label: "TIMED OUT (Q)", dot: "🟠", cold: false };
+    case ClaudeState.Busy:
+      return { label: "BUSY", dot: "⏳", cold: false };
+    case ClaudeState.Waiting:
+      return { label: "WAITING", dot: "🔵", cold: false };
+    case ClaudeState.Idle:
+      return { label: "idle", dot: "🟢", cold: false };
+    default:
+      return { label: "?", dot: "⚪", cold: false };
+  }
+}
+
+function buildDashboardInput(s: SessionStore): RenderSessionInput[] {
+  return s.all().map((sess) => ({
+    id: sess.id,
+    name: sess.customName || sess.displayName || `Claude ${sess.id.slice(-6)}`,
+    live: liveStateView(sess),
+    sessionStatus: sess.sessionStatus,
+    prs: s.prsFor(sess.id),
+  }));
+}
+
+// SessionsDashboardPanel — the Sessions & PRs editor tab. A singleton webview
+// (like SessionEditorPanel) opened in ViewColumn.Active (a normal tab, vs the
+// editor panel's Beside). Renders one row per session with its PRs; drives the
+// poller's active flag from its visibility.
+class SessionsDashboardPanel {
+  private static current: SessionsDashboardPanel | undefined;
+  private readonly disposables: vscode.Disposable[] = [];
+
+  static show(store: SessionStore, poller: PrPoller): void {
+    if (SessionsDashboardPanel.current) {
+      SessionsDashboardPanel.current.panel.reveal(vscode.ViewColumn.Active);
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "claudeSessionsDashboard",
+      "Claude Sessions & PRs",
+      vscode.ViewColumn.Active,
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    SessionsDashboardPanel.current = new SessionsDashboardPanel(
+      panel,
+      store,
+      poller,
+    );
+  }
+
+  private constructor(
+    private readonly panel: vscode.WebviewPanel,
+    private readonly store: SessionStore,
+    private readonly poller: PrPoller,
+  ) {
+    this.panel.webview.html = this.renderShell();
+
+    // Reconcile detection on open, activate polling, push initial state.
+    this.store.reconcileAllPrs();
+    this.poller.setActive(true);
+    this.postState();
+
+    this.disposables.push(
+      this.store.onDidChange(() => this.postState()),
+      this.panel.onDidChangeViewState(() => {
+        this.poller.setActive(this.panel.visible);
+        if (this.panel.visible) this.store.reconcileAllPrs();
+      }),
+      this.panel.webview.onDidReceiveMessage((m) => this.handleMessage(m)),
+    );
+
+    this.panel.onDidDispose(() => {
+      this.poller.setActive(false);
+      SessionsDashboardPanel.current = undefined;
+      for (const d of this.disposables) d.dispose();
+    });
+  }
+
+  private postState(): void {
+    const model: RenderModel = buildRenderModel(
+      buildDashboardInput(this.store),
+      Date.now(),
+      STALE_AFTER_MS,
+    );
+    void this.panel.webview.postMessage({
+      type: "state",
+      model,
+      ghUnavailable: this.poller.ghUnavailable,
+    });
+  }
+
+  private handleMessage(m: {
+    type: string;
+    sessionId?: string;
+    url?: string;
+    ref?: string;
+    to?: string;
+    status?: string;
+    reviewer?: string;
+  }): void {
+    switch (m.type) {
+      case "addPr": {
+        if (!m.sessionId || !m.ref) return;
+        const fallback = this.store.prsFor(m.sessionId)[0]?.repo;
+        const d = parsePrRef(m.ref, fallback);
+        if (!d) {
+          vscode.window.showWarningMessage(
+            `Couldn't parse "${m.ref}" as a PR — use a full URL or owner/repo#123.`,
+          );
+          return;
+        }
+        this.store.addPr(m.sessionId, d, "manual");
+        break;
+      }
+      case "detachPr":
+        if (m.sessionId && m.url) this.store.detachPr(m.sessionId, m.url);
+        break;
+      case "advancePr": {
+        if (!m.sessionId || !m.url || !m.to) return;
+        const map: Record<string, PrCheckpoint> = {
+          reviewable: PrCheckpoint.Reviewable,
+          deployed: PrCheckpoint.Deployed,
+          done: PrCheckpoint.Done,
+        };
+        const cp = map[m.to];
+        if (!cp) break;
+        this.store.setPrCheckpoint(m.sessionId, m.url, cp);
+        // Capture who was asked when advancing to reviewable.
+        if (cp === PrCheckpoint.Reviewable && m.reviewer !== undefined) {
+          this.store.setPrReviewer(m.sessionId, m.url, m.reviewer);
+        }
+        break;
+      }
+      case "setReviewer":
+        if (m.sessionId && m.url) {
+          this.store.setPrReviewer(m.sessionId, m.url, m.reviewer);
+        }
+        break;
+      case "setStatusOverride":
+        if (m.sessionId && m.url) {
+          this.store.setPrStatusOverride(
+            m.sessionId,
+            m.url,
+            m.status ? (m.status as PrStatus) : undefined,
+          );
+        }
+        break;
+      case "setSessionStatus":
+        if (m.sessionId) {
+          this.store.setSessionStatus(
+            m.sessionId,
+            m.status ? (m.status as SessionStatus) : undefined,
+          );
+        }
+        break;
+      case "focusSession":
+        if (m.sessionId) this.store.get(m.sessionId)?.terminal?.show();
+        break;
+      case "openPr":
+        if (m.url) void vscode.env.openExternal(vscode.Uri.parse(m.url));
+        break;
+      case "refreshPr":
+      case "refreshAll":
+        this.store.reconcileAllPrs();
+        void this.poller.poll();
+        break;
+    }
+  }
+
+  // Static HTML shell; the body is rendered client-side from posted state.
+  private renderShell(): string {
+    return /* html */ `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground);
+    background: var(--vscode-editor-background); padding: 16px 20px; }
+  h2 { font-weight: 400; margin: 0 0 4px; }
+  .toolbar { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+  .muted { color: var(--vscode-descriptionForeground); }
+  .banner { background: var(--vscode-inputValidation-warningBackground,rgba(255,200,0,.15));
+    border:1px solid var(--vscode-inputValidation-warningBorder,#a80); padding:6px 10px;
+    border-radius:4px; margin-bottom:12px; font-size:.9em; }
+  .hidden { display:none; }
+  .session { border-top:1px solid var(--vscode-panel-border); padding:10px 0; }
+  .srow { display:flex; align-items:center; gap:8px; }
+  .sname { font-weight:600; cursor:pointer; }
+  .sname:hover { text-decoration:underline; }
+  .grow { flex:1; }
+  select, input[type=text], button {
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border:1px solid var(--vscode-input-border,transparent); padding:3px 6px;
+    font-family:inherit; font-size:.9em; border-radius:3px; }
+  button { background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground); cursor:pointer; border:0; }
+  button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  button:hover { filter:brightness(1.15); }
+  .addpr { display:flex; gap:6px; align-items:center; }
+  .addpr input { width:230px; }
+  .prs { margin:6px 0 0 22px; display:flex; flex-direction:column; gap:5px; }
+  .pr { display:flex; align-items:center; gap:8px; font-size:.92em; }
+  .pr a { color: var(--vscode-textLink-foreground); text-decoration:none; cursor:pointer; }
+  .pr a:hover { text-decoration:underline; }
+  .pr .rev { width:140px; }
+  .badge { font-size:.8em; padding:1px 7px; border-radius:9px; white-space:nowrap;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+  .badge.merged { background:#6f42c1; color:#fff; }
+  .badge.fixing { background:#d1242f; color:#fff; }
+  .badge.deployed { background:#1a7f37; color:#fff; }
+  .badge.done { background:#444c56; color:#fff; }
+  .badge.reviewable { background:#0969da; color:#fff; }
+  .badge.shipit { background:#bf8700; color:#fff; }
+  .stale { opacity:.5; }
+  .empty { color: var(--vscode-descriptionForeground); font-style:italic; padding:24px 0; }
+</style></head><body>
+  <div class="toolbar"><h2>Claude Sessions &amp; PRs</h2><span class="grow"></span>
+    <button id="refresh" title="Reconcile detection + refresh from GitHub">↻ Refresh</button></div>
+  <div id="ghbanner" class="banner hidden">GitHub CLI (<code>gh</code>) not found on the
+    extension host — PR statuses can't refresh. Set <code>claudeCodeStatus.ghPath</code>.</div>
+  <div id="root"></div>
+<script>
+  const vscode = acquireVsCodeApi();
+  const esc = (s) => String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  document.getElementById("refresh").onclick = () => vscode.postMessage({ type: "refreshAll" });
+
+  function prRow(sid, pr, statusOptions) {
+    const el = document.createElement("div");
+    el.className = "pr" + (pr.stale ? " stale" : "");
+    const title = pr.title ? " " + pr.title : "";
+    const isReviewable = pr.status === "reviewable";
+    const isFixing = pr.status === "fixing";
+    // "Who was asked" note on reviewable/fixing rows.
+    const note =
+      (isReviewable || isFixing) && pr.reviewer
+        ? '<span class="muted">→ ' + esc(pr.reviewer) + "</span>"
+        : "";
+    // Reviewer field: an editable name input when advancing to / sitting in
+    // reviewable. Going Finalizing→reviewable, the name is optional.
+    const acts = [];
+    if (pr.canReviewable) {
+      acts.push('<input class="rev" type="text" placeholder="reviewer (optional)" />');
+      acts.push('<button data-act="reviewable">▸ reviewable</button>');
+    }
+    if (isReviewable) {
+      acts.push(
+        '<input class="rev" type="text" placeholder="reviewer" value="' +
+          esc(pr.reviewer || "") +
+          '" />',
+      );
+      acts.push('<button data-act="set-reviewer">set reviewer</button>');
+    }
+    if (pr.canDeployed) acts.push('<button data-act="deployed">▸ deployed</button>');
+    if (pr.canDone) acts.push('<button data-act="done">✓ done</button>');
+    // Status override picker — "auto" (clear) plus every status. Always shown.
+    const ovrOpts =
+      '<option value="">auto</option>' +
+      statusOptions
+        .map(
+          (o) =>
+            '<option value="' + esc(o) + '"' +
+            (pr.overridden && pr.status === o ? " selected" : "") + ">" +
+            esc(o) + "</option>",
+        )
+        .join("");
+    acts.push(
+      '<select class="ovr" title="Override displayed status">' + ovrOpts + "</select>",
+    );
+    acts.push('<button data-act="detach" title="Detach PR">✕</button>');
+    const pin = pr.overridden ? "📌 " : "";
+    el.innerHTML =
+      '<a class="open">#' + pr.number + esc(title) + "</a>" +
+      '<span class="badge ' + esc(pr.status) + '" title="' +
+      (pr.overridden ? "manually pinned" : "auto-resolved") + '">' +
+      pin + esc(pr.badge) + "</span>" +
+      note +
+      '<span class="grow"></span>' + acts.join("");
+    el.querySelector(".open").onclick = () => vscode.postMessage({ type: "openPr", url: pr.url });
+    const revInput = el.querySelector(".rev");
+    el.querySelectorAll("button[data-act]").forEach((b) => {
+      b.onclick = () => {
+        const act = b.getAttribute("data-act");
+        const reviewer = revInput ? revInput.value.trim() : "";
+        if (act === "detach") {
+          vscode.postMessage({ type: "detachPr", sessionId: sid, url: pr.url });
+        } else if (act === "reviewable") {
+          vscode.postMessage({ type: "advancePr", sessionId: sid, url: pr.url, to: "reviewable", reviewer });
+        } else if (act === "set-reviewer") {
+          vscode.postMessage({ type: "setReviewer", sessionId: sid, url: pr.url, reviewer });
+        } else {
+          vscode.postMessage({ type: "advancePr", sessionId: sid, url: pr.url, to: act });
+        }
+      };
+    });
+    if (revInput) {
+      revInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          const reviewer = revInput.value.trim();
+          if (isReviewable) {
+            vscode.postMessage({ type: "setReviewer", sessionId: sid, url: pr.url, reviewer });
+          } else {
+            vscode.postMessage({ type: "advancePr", sessionId: sid, url: pr.url, to: "reviewable", reviewer });
+          }
+        }
+      });
+    }
+    const ovr = el.querySelector(".ovr");
+    if (ovr) {
+      ovr.onchange = () =>
+        vscode.postMessage({ type: "setStatusOverride", sessionId: sid, url: pr.url, status: ovr.value });
+    }
+    return el;
+  }
+
+  function statusSelect(sid, current, options) {
+    const sel = document.createElement("select");
+    sel.innerHTML = '<option value="">— status —</option>' +
+      options.map((o) => '<option value="' + esc(o) + '"' +
+        (o === current ? " selected" : "") + ">" + esc(o) + "</option>").join("");
+    sel.onchange = () =>
+      vscode.postMessage({ type: "setSessionStatus", sessionId: sid, status: sel.value });
+    return sel;
+  }
+
+  function sessionRow(s, options, statusOptions) {
+    const wrap = document.createElement("div");
+    wrap.className = "session";
+    const head = document.createElement("div");
+    head.className = "srow";
+    head.innerHTML = '<span>' + esc(s.live.dot) + '</span>' +
+      '<span class="sname">' + esc(s.name) + '</span>' +
+      '<span class="muted">' + esc(s.live.label) + '</span><span class="grow"></span>';
+    head.querySelector(".sname").onclick = () =>
+      vscode.postMessage({ type: "focusSession", sessionId: s.id });
+    if (s.showSessionStatus) head.appendChild(statusSelect(s.id, s.sessionStatus, options));
+    const add = document.createElement("span");
+    add.className = "addpr";
+    add.innerHTML = '<input type="text" placeholder="add PR: URL or owner/repo#123" />' +
+      '<button class="primary">+ Add PR</button>';
+    const input = add.querySelector("input");
+    const submit = () => {
+      const ref = input.value.trim();
+      if (ref) { vscode.postMessage({ type: "addPr", sessionId: s.id, ref }); input.value = ""; }
+    };
+    add.querySelector("button").onclick = submit;
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    head.appendChild(add);
+    wrap.appendChild(head);
+    if (s.prs.length) {
+      const prs = document.createElement("div");
+      prs.className = "prs";
+      s.prs.forEach((pr) => prs.appendChild(prRow(s.id, pr, statusOptions)));
+      wrap.appendChild(prs);
+    }
+    return wrap;
+  }
+
+  function render(model, ghUnavailable) {
+    document.getElementById("ghbanner").classList.toggle("hidden", !ghUnavailable);
+    const root = document.getElementById("root");
+    root.innerHTML = "";
+    if (!model.sessions.length) {
+      root.innerHTML = '<div class="empty">No tracked sessions in this window.</div>';
+      return;
+    }
+    model.sessions.forEach((s) =>
+      root.appendChild(sessionRow(s, model.sessionStatusOptions, model.statusOptions)),
+    );
+  }
+
+  window.addEventListener("message", (e) => {
+    const msg = e.data;
+    if (msg.type === "state") render(msg.model, msg.ghUnavailable);
+  });
+</script></body></html>`;
+  }
+}
+
 // ----- module globals -----
 
 let store: SessionStore;
@@ -2516,6 +2948,13 @@ export function activate(context: vscode.ExtensionContext): void {
   // so the machinery exists; the dashboard UI drives it.
   prPoller = new PrPoller(store);
   prPoller.start();
+
+  // Sessions & PRs dashboard — a normal editor tab.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeCodeStatus.openDashboard", () => {
+      SessionsDashboardPanel.show(store, prPoller);
+    }),
+  );
 
   outputChannel.appendLine("All commands registered successfully");
 }

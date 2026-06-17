@@ -36,9 +36,14 @@ Usage:
   cc-status rename  --name NAME [--id ID]
   cc-status list
   cc-status get     [--id ID | --name NAME]
+  cc-status pr-status --pr URL --checkpoint CP [--stage N] [--id ID | --name NAME]
 
 Self is targeted by default via \$VSCODE_CC_ID. Override with --id or
 --name to act on a sibling session.
+
+pr-status reports a PR's workflow checkpoint to the Sessions & PRs dashboard.
+  CP is one of: drafting shipit shipit-done reviewable deployed done
+  e.g.  cc-status pr-status --pr "\$PR_URL" --checkpoint shipit --stage 3
 EOF
 }
 
@@ -148,8 +153,11 @@ shift
 NAME=""
 ID=""
 SOURCE=""
+PR=""
+CHECKPOINT=""
+STAGE=""
 
-# Parse --name, --id, --source from remaining args.
+# Parse target/value flags from remaining args.
 while [ $# -gt 0 ]; do
     case "$1" in
         --name)
@@ -162,6 +170,18 @@ while [ $# -gt 0 ]; do
             ;;
         --source)
             SOURCE="$2"
+            shift 2
+            ;;
+        --pr)
+            PR="$2"
+            shift 2
+            ;;
+        --checkpoint)
+            CHECKPOINT="$2"
+            shift 2
+            ;;
+        --stage)
+            STAGE="$2"
             shift 2
             ;;
         --help|-h)
@@ -201,6 +221,17 @@ build_args_json() {
             [ -n "$NAME" ] && pairs="$pairs,\"new_name\":$(json_quote "$NAME")"
             printf '{%s}' "${pairs#,}"
             ;;
+        pr-status)
+            # --id/--name select the TARGET (default self via $VSCODE_CC_ID);
+            # --pr/--checkpoint/--stage carry the PR + its workflow checkpoint.
+            local pairs=""
+            [ -n "$ID" ] && pairs="$pairs,\"id\":$(json_quote "$ID")"
+            [ -n "$NAME" ] && pairs="$pairs,\"name\":$(json_quote "$NAME")"
+            [ -n "$PR" ] && pairs="$pairs,\"pr\":$(json_quote "$PR")"
+            [ -n "$CHECKPOINT" ] && pairs="$pairs,\"checkpoint\":$(json_quote "$CHECKPOINT")"
+            [ -n "$STAGE" ] && pairs="$pairs,\"stage\":$(json_quote "$STAGE")"
+            printf '{%s}' "${pairs#,}"
+            ;;
         list)
             printf '{}'
             ;;
@@ -208,7 +239,7 @@ build_args_json() {
 }
 
 case "$CMD" in
-    sibling|fork|heal|remake|rename|list|get)
+    sibling|fork|heal|remake|rename|list|get|pr-status)
         ARGS_JSON=$(build_args_json "$CMD")
         send_request "$CMD" "$ARGS_JSON"
         ;;

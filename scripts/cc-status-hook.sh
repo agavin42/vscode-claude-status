@@ -15,6 +15,7 @@ TX_FILE="$STATE_DIR/$VSCODE_CC_ID.tx"
 VERSION_FILE="$STATE_DIR/$VSCODE_CC_ID.version"
 PROMPT_FILE="$STATE_DIR/$VSCODE_CC_ID.prompt"
 SUBAGENT_FILE="$STATE_DIR/$VSCODE_CC_ID.subagents"
+PRS_LOG_FILE="$STATE_DIR/$VSCODE_CC_ID.prs.log"
 
 # Ensure state directory exists
 mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
@@ -65,6 +66,22 @@ bump_subagents() {
     echo "$new" > "$SUBAGENT_FILE" 2>/dev/null
 }
 
+# Dashboard PR detection: when a `gh pr create` call returns a github pull URL,
+# append it (https-normalized) for the Sessions & PRs dashboard to reconcile.
+# Append-only; the extension owns dedup.
+detect_pr_for_dashboard() {
+    local input="$1"
+    case "$input" in
+        *"gh pr create"*) ;;
+        *) return 0 ;;
+    esac
+    local pr_url
+    pr_url=$(printf '%s' "$input" \
+        | grep -oE 'github\.com/[^/"]+/[^/"]+/pull/[0-9]+' | head -1)
+    [ -z "$pr_url" ] && return 0
+    printf 'https://%s\n' "$pr_url" >> "$PRS_LOG_FILE" 2>/dev/null
+}
+
 # Map hook event to state
 case "$HOOK_EVENT" in
     PermissionRequest)
@@ -81,6 +98,10 @@ case "$HOOK_EVENT" in
         ;;
     PreToolUse|PostToolUse|PostToolUseFailure|PostToolBatch)
         STATE="BUSY"
+        # A finished Bash call is the only place a `gh pr create` URL surfaces.
+        if [ "$HOOK_EVENT" = "PostToolUse" ] && [ "$TOOL_NAME" = "Bash" ]; then
+            detect_pr_for_dashboard "$INPUT"
+        fi
         ;;
     Stop)
         STATE="IDLE"

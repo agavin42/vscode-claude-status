@@ -3,6 +3,26 @@ import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { execFile } from "child_process";
+import {
+  GithubFacts,
+  PrCheckpoint,
+  PrStatus,
+  SessionPr,
+  SessionStatus,
+} from "./pr/types";
+import { isTerminalForPolling } from "./pr/status";
+import {
+  DetectedPr,
+  extractPrUrls,
+  scanTranscriptForCreatedPrs,
+} from "./pr/detect";
+import { GH_PR_VIEW_FIELDS, mapGhJsonToFacts } from "./pr/github";
+import {
+  applyGithubFactsToMap,
+  GithubFactsUpdate,
+  upsertPrCheckpoint,
+} from "./pr/apply";
 
 // Terminal state enum
 enum ClaudeState {
@@ -40,6 +60,11 @@ interface PersistedSession {
   parentSessionId?: string; // for forked sessions (Phase 7)
   parentDisplayName?: string;
   createdAt: number; // epoch ms
+  sessionStatus?: SessionStatus; // manual lifecycle phase; shown only when no PRs
+  // Snapshot of the last transcript path the hook reported. Persisted (unlike
+  // the transient transcriptPath) so the retroactive PR scanner can reach a
+  // cold session's transcript without re-deriving the path from the launch cwd.
+  lastTranscriptPath?: string;
 }
 
 // Runtime Session — persistent fields plus transient state. The terminal field
@@ -78,6 +103,9 @@ interface LegacyPersistedTerminal {
 class SessionStore {
   private sessions = new Map<string, Session>();
   private order: string[] = [];
+  // PR records keyed by owning ccId. Source of truth (persisted); the
+  // .prs.log / .prs.scanned sidecars are reconstructable caches.
+  private prs = new Map<string, SessionPr[]>();
   private readonly emitter = new vscode.EventEmitter<void>();
   readonly onDidChange = this.emitter.event;
 
@@ -101,13 +129,15 @@ class SessionStore {
 
   // ----- mutations (always save) -----
 
-  create(args: {
-    resume?: boolean;
-    dir?: string;
-    forkFrom?: string;
-    customName?: string;
-    parentDisplayName?: string;
-  } = {}): Session | undefined {
+  create(
+    args: {
+      resume?: boolean;
+      dir?: string;
+      forkFrom?: string;
+      customName?: string;
+      parentDisplayName?: string;
+    } = {},
+  ): Session | undefined {
     ensureStateDir();
 
     const ccId = generateCcId();
@@ -387,11 +417,24 @@ class SessionStore {
     // looks up by terminal and will find nothing, no-op.
     this.sessions.delete(id);
     this.order = this.order.filter((x) => x !== id);
+    // delete() is the ONLY purge point for PR data. markCold/SessionEnd
+    // preserve it (a cold session still shows what it shipped).
+    this.prs.delete(id);
     if (terminal) {
       terminal.dispose();
     }
-    // Unlink every sidecar Phase 1 may have written.
-    for (const ext of ["state", "session", "cwd", "tx", "version", "prompt", "subagents"]) {
+    // Unlink every sidecar Phase 1 may have written, plus the PR caches.
+    for (const ext of [
+      "state",
+      "session",
+      "cwd",
+      "tx",
+      "version",
+      "prompt",
+      "subagents",
+      "prs.log",
+      "prs.scanned",
+    ]) {
       try {
         fs.unlinkSync(path.join(STATE_DIR, `${id}.${ext}`));
       } catch (e) {
@@ -408,6 +451,219 @@ class SessionStore {
     if (!s) return;
     Object.assign(s, patch);
     this.save();
+    this.emitter.fire();
+  }
+
+  // ----- PR queries (pure) -----
+
+  prsFor(id: string): SessionPr[] {
+    return this.prs.get(id) ?? [];
+  }
+
+  // All PR records across sessions, paired with their owning ccId. Used by the
+  // poller to select non-terminal PRs to refresh.
+  allPrs(): { ccId: string; pr: SessionPr }[] {
+    const out: { ccId: string; pr: SessionPr }[] = [];
+    for (const [ccId, list] of this.prs) {
+      for (const pr of list) out.push({ ccId, pr });
+    }
+    return out;
+  }
+
+  // ----- PR mutations (always save) -----
+
+  setSessionStatus(id: string, status: SessionStatus | undefined): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    s.sessionStatus = status;
+    this.save();
+    this.emitter.fire();
+  }
+
+  // Insert a PR tied to a session if not already present (dedup by canonical
+  // URL). Returns the record (existing or new).
+  addPr(
+    id: string,
+    detected: DetectedPr,
+    origin: "auto" | "manual",
+  ): SessionPr | undefined {
+    if (!this.sessions.has(id)) return undefined;
+    const list = this.prs.get(id) ?? [];
+    const existing = list.find((p) => p.url === detected.url);
+    if (existing) return existing;
+    const pr: SessionPr = {
+      url: detected.url,
+      repo: detected.repo,
+      number: detected.number,
+      sessionId: id,
+      origin,
+      checkpoint: PrCheckpoint.Drafting,
+      addedAt: Date.now(),
+    };
+    list.push(pr);
+    this.prs.set(id, list);
+    this.save();
+    this.emitter.fire();
+    log(`Tied PR ${detected.url} to ${id} (${origin})`);
+    return pr;
+  }
+
+  detachPr(id: string, url: string): void {
+    const list = this.prs.get(id);
+    if (!list) return;
+    const next = list.filter((p) => p.url !== url);
+    if (next.length === list.length) return;
+    this.prs.set(id, next);
+    this.save();
+    this.emitter.fire();
+    log(`Detached PR ${url} from ${id}`);
+  }
+
+  // Set a PR's checkpoint (+ optional shipit stage). Tolerantly creates the
+  // record if the PR isn't tied yet — shipit may report a stage before the
+  // create-hook detection has landed, and the stage shouldn't be lost.
+  setPrCheckpoint(
+    id: string,
+    url: string,
+    checkpoint: PrCheckpoint,
+    stage?: number,
+  ): SessionPr | undefined {
+    if (!this.sessions.has(id)) return undefined;
+    const pr = upsertPrCheckpoint(
+      this.prs,
+      id,
+      url,
+      checkpoint,
+      stage,
+      Date.now(),
+    );
+    if (!pr) return undefined;
+    this.save();
+    this.emitter.fire();
+    log(
+      `PR ${pr.url} checkpoint → ${checkpoint}${stage !== undefined ? ` (stage ${stage})` : ""}`,
+    );
+    return pr;
+  }
+
+  // Record who was asked to review this PR. Pass undefined/empty to clear.
+  setPrReviewer(id: string, url: string, reviewer: string | undefined): void {
+    const pr = this.prs.get(id)?.find((p) => p.url === url);
+    if (!pr) return;
+    pr.reviewer = reviewer && reviewer.trim() ? reviewer.trim() : undefined;
+    this.save();
+    this.emitter.fire();
+  }
+
+  // Pin (or clear) a PR's displayed status. undefined returns it to automatic
+  // resolution. An invalid value is treated as a clear.
+  setPrStatusOverride(
+    id: string,
+    url: string,
+    status: PrStatus | undefined,
+  ): void {
+    const pr = this.prs.get(id)?.find((p) => p.url === url);
+    if (!pr) return;
+    const valid =
+      status && (Object.values(PrStatus) as string[]).includes(status);
+    pr.statusOverride = valid ? status : undefined;
+    this.save();
+    this.emitter.fire();
+  }
+
+  // Apply a batch of freshly-polled GitHub facts in ONE save + ONE fire. Each
+  // update re-looks-up its PR by (ccId, url) so a record detached/mutated
+  // mid-poll is dropped, not resurrected.
+  applyGithubFacts(updates: GithubFactsUpdate[]): void {
+    if (!applyGithubFactsToMap(this.prs, updates)) return;
+    this.save();
+    this.emitter.fire();
+  }
+
+  // Reconcile auto-detected PRs into the store for one session: drain the
+  // forward-detection .prs.log and scan the transcript for created PRs. Dedups
+  // against existing records. One save + fire if anything was added.
+  reconcilePrs(id: string): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+
+    const detected: DetectedPr[] = [];
+    const logRaw = readSidecar(id, "prs.log");
+    if (logRaw) detected.push(...extractPrUrls(logRaw));
+
+    const txPath =
+      s.lastTranscriptPath ||
+      s.transcriptPath ||
+      (s.claudeSessionId
+        ? deriveTranscriptPath(s.directory, s.claudeSessionId)
+        : undefined);
+    if (txPath) detected.push(...this.scanTranscriptIfStale(id, txPath));
+
+    if (detected.length === 0) return;
+
+    const list = this.prs.get(id) ?? [];
+    let added = false;
+    for (const d of detected) {
+      if (list.some((p) => p.url === d.url)) continue;
+      list.push({
+        url: d.url,
+        repo: d.repo,
+        number: d.number,
+        sessionId: id,
+        origin: "auto",
+        checkpoint: PrCheckpoint.Drafting,
+        addedAt: Date.now(),
+      });
+      added = true;
+    }
+    if (!added) return;
+    this.prs.set(id, list);
+    this.save();
+    this.emitter.fire();
+    log(`Reconciled PRs for ${id}: now ${list.length}`);
+  }
+
+  // Scan the transcript only when its (path, mtime) differs from the marker.
+  // The marker is dropped on remake() so a resumed transcript re-scans.
+  private scanTranscriptIfStale(id: string, txPath: string): DetectedPr[] {
+    let mtime = 0;
+    try {
+      mtime = Math.floor(fs.statSync(txPath).mtimeMs);
+    } catch (e) {
+      return [];
+    }
+    const markerPath = path.join(STATE_DIR, `${id}.prs.scanned`);
+    try {
+      const m = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as {
+        path?: string;
+        mtime?: number;
+      };
+      if (m.path === txPath && m.mtime === mtime) return [];
+    } catch (e) {
+      /* no/invalid marker — scan */
+    }
+    let found: DetectedPr[] = [];
+    try {
+      found = scanTranscriptForCreatedPrs(fs.readFileSync(txPath, "utf-8"));
+    } catch (e) {
+      return [];
+    }
+    try {
+      fs.writeFileSync(markerPath, JSON.stringify({ path: txPath, mtime }));
+    } catch (e) {
+      /* ignore */
+    }
+    return found;
+  }
+
+  // Reconcile every known session (dashboard open / low-freq timer).
+  reconcileAllPrs(): void {
+    for (const id of this.sessions.keys()) this.reconcilePrs(id);
+  }
+
+  // Fire the change event without a state mutation (e.g. the poller's
+  // gh-unavailable banner).
+  notifyChanged(): void {
     this.emitter.fire();
   }
 
@@ -443,10 +699,21 @@ class SessionStore {
       parentSessionId: s.parentSessionId,
       parentDisplayName: s.parentDisplayName,
       createdAt: s.createdAt,
+      sessionStatus: s.sessionStatus,
+      lastTranscriptPath: s.lastTranscriptPath,
     }));
+    // PR records as a plain ccId→SessionPr[] record. An older binary on
+    // rollback simply ignores this unknown key (no legacy mirror needed).
+    const prsObj: Record<string, SessionPr[]> = {};
+    for (const [ccId, list] of this.prs) {
+      if (list.length > 0) prsObj[ccId] = list;
+    }
     this.ctx.workspaceState.update("trackedTerminals", persisted);
     this.ctx.workspaceState.update("terminalOrder", this.order);
-    log(`Saved state: ${persisted.length} sessions, order=${this.order.length}`);
+    this.ctx.workspaceState.update("sessionPrs", prsObj);
+    log(
+      `Saved state: ${persisted.length} sessions, order=${this.order.length}, prSessions=${Object.keys(prsObj).length}`,
+    );
   }
 
   restore(): void {
@@ -460,6 +727,13 @@ class SessionStore {
       "terminalOrder",
       [],
     );
+
+    // PR records rehydrate independently of sessions.
+    const prsObj = this.ctx.workspaceState.get<Record<string, SessionPr[]>>(
+      "sessionPrs",
+      {},
+    );
+    this.prs = new Map(Object.entries(prsObj));
 
     if (persistedRaw.length === 0) {
       log("No saved state to restore");
@@ -489,9 +763,7 @@ class SessionStore {
         // back to the project root.
         const repaired = repairWorktreeDrift(p.directory);
         if (repaired !== p.directory) {
-          log(
-            `Auto-repairing ${ccId} directory: ${p.directory} → ${repaired}`,
-          );
+          log(`Auto-repairing ${ccId} directory: ${p.directory} → ${repaired}`);
         }
         return {
           ...p,
@@ -530,7 +802,9 @@ class SessionStore {
       const envId = opts?.env
         ? (opts.env as Record<string, string>)["VSCODE_CC_ID"]
         : undefined;
-      log(`  terminal "${t.name}" — creationOptions.env.VSCODE_CC_ID=${envId ?? "(none)"}`);
+      log(
+        `  terminal "${t.name}" — creationOptions.env.VSCODE_CC_ID=${envId ?? "(none)"}`,
+      );
     }
 
     const boundTerminals = new Set<vscode.Terminal>();
@@ -599,7 +873,9 @@ class SessionStore {
         this.bindLegacyMatchedTerminal(data, hit);
         persistedById.delete(data.id);
         boundTerminals.add(hit);
-        log(`Matched ${data.id} by customName "${data.customName}" → "${hit.name}"`);
+        log(
+          `Matched ${data.id} by customName "${data.customName}" → "${hit.name}"`,
+        );
       }
     }
 
@@ -697,10 +973,7 @@ class SessionStore {
     // .prompt are transient and would lie now; reset .state and unlink
     // .prompt so cold sessions don't show stale data.
     try {
-      fs.writeFileSync(
-        path.join(STATE_DIR, `${s.id}.state`),
-        "IDLE\n",
-      );
+      fs.writeFileSync(path.join(STATE_DIR, `${s.id}.state`), "IDLE\n");
     } catch (e) {
       /* ignore */
     }
@@ -756,6 +1029,12 @@ class SessionStore {
       }
       if (newTranscript && newTranscript !== session.transcriptPath) {
         session.transcriptPath = newTranscript; // transient, no save
+      }
+      // Persist a snapshot of the transcript path so the retroactive PR
+      // scanner can reach this session's transcript after it goes cold.
+      if (newTranscript && newTranscript !== session.lastTranscriptPath) {
+        session.lastTranscriptPath = newTranscript;
+        mutated = true;
       }
       if (newVersion && newVersion !== session.claudeVersion) {
         session.claudeVersion = newVersion;
@@ -894,9 +1173,7 @@ class CommandChannel {
   }
 
   private handle(takenPath: string): void {
-    const nonce = path
-      .basename(takenPath)
-      .replace(/\.taken$/, "");
+    const nonce = path.basename(takenPath).replace(/\.taken$/, "");
     const resPath = path.join(this.cmdDir, `${nonce}.res`);
 
     let raw: string;
@@ -1031,7 +1308,8 @@ class CommandChannel {
   ): Record<string, unknown> {
     const target = this.resolveSource(from, args);
     if (!target) throw new Error("target session not found in this window");
-    const newName = typeof args.new_name === "string" ? args.new_name : undefined;
+    const newName =
+      typeof args.new_name === "string" ? args.new_name : undefined;
     if (!newName) throw new Error("missing --name");
     this.store.update(target.id, { customName: newName });
     if (
@@ -1059,6 +1337,144 @@ class CommandChannel {
     if (!target) throw new Error("session not found in this window");
     return sessionSummary(target);
   }
+}
+
+// Dashboard refresh cadence + freshness window. STALE_AFTER drives the dimming
+// in the render model; the poller runs at POLL_INTERVAL while the dashboard is
+// visible and the window is focused.
+const POLL_INTERVAL_MS = 60_000;
+export const STALE_AFTER_MS = POLL_INTERVAL_MS * 3;
+const POLL_CONCURRENCY = 4;
+
+// PrPoller — refreshes non-terminal PRs' GitHub facts via `gh pr view`.
+// Lifecycle mirrors CommandChannel (start/stop owned by activate/deactivate),
+// but it only does work while the dashboard is active AND the window focused.
+class PrPoller {
+  private interval?: NodeJS.Timeout;
+  private active = false; // dashboard panel visible
+  private polling = false; // re-entrancy guard
+  private ghPath: string | undefined | null = undefined;
+  private _ghUnavailable = false;
+
+  constructor(private readonly store: SessionStore) {}
+
+  get ghUnavailable(): boolean {
+    return this._ghUnavailable;
+  }
+
+  start(): void {
+    this.interval = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
+  }
+
+  stop(): void {
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = undefined;
+    }
+  }
+
+  // Called by the dashboard on open/visibility change. Setting active true
+  // triggers an immediate refresh so the tab isn't stale on open.
+  setActive(active: boolean): void {
+    this.active = active;
+    if (active) void this.poll();
+  }
+
+  private shouldPoll(): boolean {
+    return this.active && vscode.window.state.focused && !this.polling;
+  }
+
+  // Resolve `gh` once via a login shell so we inherit the user's PATH/auth
+  // (the extension host does NOT inherit the interactive shell environment).
+  private async resolveGh(): Promise<string | null> {
+    if (this.ghPath !== undefined) return this.ghPath;
+    const configured = vscode.workspace
+      .getConfiguration("claudeCodeStatus")
+      .get<string>("ghPath", "gh");
+    if (configured && configured.includes("/")) {
+      this.ghPath = configured;
+      return this.ghPath;
+    }
+    const shell = process.env.SHELL || "/bin/bash";
+    try {
+      const out = await execFileP(shell, ["-lc", `command -v ${configured}`]);
+      this.ghPath = out.stdout.trim() || null;
+    } catch (e) {
+      this.ghPath = null;
+    }
+    return this.ghPath;
+  }
+
+  async poll(): Promise<void> {
+    if (!this.shouldPoll()) return;
+    this.polling = true;
+    try {
+      const gh = await this.resolveGh();
+      if (!gh) {
+        this._ghUnavailable = true;
+        this.store.notifyChanged();
+        return;
+      }
+      this._ghUnavailable = false;
+
+      const targets = this.store
+        .allPrs()
+        .filter(({ pr }) => !isTerminalForPolling(pr));
+      if (targets.length === 0) return;
+
+      const updates: GithubFactsUpdate[] = [];
+      const now = Date.now();
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        while (cursor < targets.length) {
+          const { ccId, pr } = targets[cursor++];
+          try {
+            const { stdout } = await execFileP(gh, [
+              "pr",
+              "view",
+              pr.url,
+              "--json",
+              GH_PR_VIEW_FIELDS.join(","),
+            ]);
+            const json = JSON.parse(stdout) as Record<string, unknown>;
+            updates.push({
+              ccId,
+              url: pr.url,
+              facts: mapGhJsonToFacts(json, now),
+            });
+          } catch (e) {
+            // Transient failure — leave the last facts; the row dims via STALE.
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(POLL_CONCURRENCY, targets.length) }, () =>
+          worker(),
+        ),
+      );
+      this.store.applyGithubFacts(updates);
+    } finally {
+      this.polling = false;
+    }
+  }
+}
+
+// Promisified execFile returning {stdout, stderr}.
+function execFileP(
+  file: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      args,
+      { timeout: 15_000, maxBuffer: 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) reject(err);
+        else resolve({ stdout: String(stdout), stderr: String(stderr) });
+      },
+    );
+  });
 }
 
 function sessionSummary(s: Session): Record<string, unknown> {
@@ -1143,6 +1559,25 @@ function repairWorktreeDrift(directory: string): string {
   return directory.slice(0, idx);
 }
 
+// Re-derive a session's transcript path from its launch cwd + claudeSessionId,
+// the way Claude Code lays out ~/.claude/projects/<encoded-cwd>/<id>.jsonl
+// (the cwd is encoded by replacing path separators and dots with '-'). FALLBACK
+// only — the persisted lastTranscriptPath is preferred (the encoding depends on
+// the launch cwd, which the worktree-drift bug could corrupt; hence the repair).
+function deriveTranscriptPath(
+  directory: string,
+  claudeSessionId: string,
+): string {
+  const encoded = repairWorktreeDrift(directory).replace(/[/.]/g, "-");
+  return path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    encoded,
+    `${claudeSessionId}.jsonl`,
+  );
+}
+
 // Generic sidecar reader. Returns undefined if the file doesn't exist or
 // can't be read. Caller decides how to interpret the trimmed content.
 function readSidecar(ccId: string, suffix: string): string | undefined {
@@ -1201,7 +1636,9 @@ class ClaudeTerminalsProvider
 
   getTreeItem(session: Session): vscode.TreeItem {
     const label =
-      session.customName || session.displayName || `Claude ${session.id.slice(-6)}`;
+      session.customName ||
+      session.displayName ||
+      `Claude ${session.id.slice(-6)}`;
 
     const item = new vscode.TreeItem(
       label,
@@ -1275,10 +1712,11 @@ class ClaudeTerminalsProvider
       }
     }
 
-    const promptPreview = !isCold && session.lastPrompt
-      ? session.lastPrompt.slice(0, 50) +
-        (session.lastPrompt.length > 50 ? "..." : "")
-      : "";
+    const promptPreview =
+      !isCold && session.lastPrompt
+        ? session.lastPrompt.slice(0, 50) +
+          (session.lastPrompt.length > 50 ? "..." : "")
+        : "";
     const subagentBadge =
       !isCold && session.subagentCount > 0
         ? ` · ${session.subagentCount} sub`
@@ -1291,7 +1729,9 @@ class ClaudeTerminalsProvider
     md.appendMarkdown(`**${label}**\n\n`);
     md.appendMarkdown(`**State:** ${statePrefix}`);
     if (!isCold && session.subagentCount > 0) {
-      md.appendMarkdown(` · ${session.subagentCount} subagent${session.subagentCount === 1 ? "" : "s"}`);
+      md.appendMarkdown(
+        ` · ${session.subagentCount} subagent${session.subagentCount === 1 ? "" : "s"}`,
+      );
     }
     md.appendMarkdown(`\n\n`);
     md.appendMarkdown(`**Directory:** \`${session.directory}\`\n\n`);
@@ -1303,7 +1743,9 @@ class ClaudeTerminalsProvider
       md.appendMarkdown(`**Now in:** \`${session.currentCwd}\`\n\n`);
     }
     if (session.claudeSessionId || session.claudeVersion) {
-      const v = session.claudeVersion ? session.claudeVersion.replace(/\s*\(Claude Code\)\s*$/, "") : undefined;
+      const v = session.claudeVersion
+        ? session.claudeVersion.replace(/\s*\(Claude Code\)\s*$/, "")
+        : undefined;
       const sidTail = session.claudeSessionId
         ? session.claudeSessionId.slice(-8)
         : undefined;
@@ -1441,10 +1883,7 @@ class SessionEditorPanel {
     if (newName !== (this.session.customName || "")) {
       update.customName = newName || undefined;
     }
-    if (
-      patch.directory &&
-      patch.directory !== this.session.directory
-    ) {
+    if (patch.directory && patch.directory !== this.session.directory) {
       update.directory = patch.directory;
     }
     if (Object.keys(update).length > 0) {
@@ -1467,9 +1906,7 @@ class SessionEditorPanel {
     const s = this.session;
     const cs = s.claudeSessionId || "";
     const cv = (s.claudeVersion || "").replace(/\s*\(Claude Code\)\s*$/, "");
-    const created = s.createdAt
-      ? new Date(s.createdAt).toLocaleString()
-      : "";
+    const created = s.createdAt ? new Date(s.createdAt).toLocaleString() : "";
     const parent = s.parentDisplayName || "";
     const esc = htmlEscape;
 
@@ -1641,6 +2078,7 @@ let claudeTerminalsProvider: ClaudeTerminalsProvider;
 let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let commandChannel: CommandChannel;
+let prPoller: PrPoller;
 
 function log(msg: string): void {
   const debug = vscode.workspace
@@ -1818,7 +2256,11 @@ export function activate(context: vscode.ExtensionContext): void {
           const name = session.customName || session.displayName;
           const choice = await vscode.window.showWarningMessage(
             `Delete session "${name}"?`,
-            { modal: true, detail: "Removes the panel record and sidecar files. The Claude conversation transcript stays on disk." },
+            {
+              modal: true,
+              detail:
+                "Removes the panel record and sidecar files. The Claude conversation transcript stays on disk.",
+            },
             "Delete",
           );
           if (choice !== "Delete") return;
@@ -1835,10 +2277,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const openEditor = (session: Session) =>
     SessionEditorPanel.show(store, session);
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "claudeCodeStatus.editSession",
-      openEditor,
-    ),
+    vscode.commands.registerCommand("claudeCodeStatus.editSession", openEditor),
   );
   context.subscriptions.push(
     vscode.commands.registerCommand(
@@ -1888,7 +2327,9 @@ export function activate(context: vscode.ExtensionContext): void {
           if (choice === "New Terminal") {
             vscode.commands.executeCommand("claudeCodeStatus.newTerminal");
           } else if (choice === "New (Resume)") {
-            vscode.commands.executeCommand("claudeCodeStatus.newTerminalResume");
+            vscode.commands.executeCommand(
+              "claudeCodeStatus.newTerminalResume",
+            );
           }
           return;
         }
@@ -1910,9 +2351,7 @@ export function activate(context: vscode.ExtensionContext): void {
         });
 
         allTerminals.forEach((terminal) => {
-          const session = store
-            .all()
-            .find((s) => s.terminal === terminal);
+          const session = store.all().find((s) => s.terminal === terminal);
           if (session) {
             const config = STATE_CONFIG[session.state];
             const needsAttention = session.state === ClaudeState.Permissions;
@@ -2073,6 +2512,11 @@ export function activate(context: vscode.ExtensionContext): void {
   commandChannel = new CommandChannel(store);
   commandChannel.start();
 
+  // PR poller — idle until a dashboard activates it (setActive). Created here
+  // so the machinery exists; the dashboard UI drives it.
+  prPoller = new PrPoller(store);
+  prPoller.start();
+
   outputChannel.appendLine("All commands registered successfully");
 }
 
@@ -2080,4 +2524,5 @@ export function deactivate(): void {
   // Stop polling but preserve state files — they're needed for reload restore.
   store?.stopAllPolling();
   commandChannel?.stop();
+  prPoller?.stop();
 }

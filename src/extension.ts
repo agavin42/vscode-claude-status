@@ -3,6 +3,7 @@ import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { classifyBusyTail } from "./transcriptLiveness";
 
 // Terminal state enum
 enum ClaudeState {
@@ -101,13 +102,15 @@ class SessionStore {
 
   // ----- mutations (always save) -----
 
-  create(args: {
-    resume?: boolean;
-    dir?: string;
-    forkFrom?: string;
-    customName?: string;
-    parentDisplayName?: string;
-  } = {}): Session | undefined {
+  create(
+    args: {
+      resume?: boolean;
+      dir?: string;
+      forkFrom?: string;
+      customName?: string;
+      parentDisplayName?: string;
+    } = {},
+  ): Session | undefined {
     ensureStateDir();
 
     const ccId = generateCcId();
@@ -391,7 +394,15 @@ class SessionStore {
       terminal.dispose();
     }
     // Unlink every sidecar Phase 1 may have written.
-    for (const ext of ["state", "session", "cwd", "tx", "version", "prompt", "subagents"]) {
+    for (const ext of [
+      "state",
+      "session",
+      "cwd",
+      "tx",
+      "version",
+      "prompt",
+      "subagents",
+    ]) {
       try {
         fs.unlinkSync(path.join(STATE_DIR, `${id}.${ext}`));
       } catch (e) {
@@ -446,7 +457,9 @@ class SessionStore {
     }));
     this.ctx.workspaceState.update("trackedTerminals", persisted);
     this.ctx.workspaceState.update("terminalOrder", this.order);
-    log(`Saved state: ${persisted.length} sessions, order=${this.order.length}`);
+    log(
+      `Saved state: ${persisted.length} sessions, order=${this.order.length}`,
+    );
   }
 
   restore(): void {
@@ -489,9 +502,7 @@ class SessionStore {
         // back to the project root.
         const repaired = repairWorktreeDrift(p.directory);
         if (repaired !== p.directory) {
-          log(
-            `Auto-repairing ${ccId} directory: ${p.directory} → ${repaired}`,
-          );
+          log(`Auto-repairing ${ccId} directory: ${p.directory} → ${repaired}`);
         }
         return {
           ...p,
@@ -530,7 +541,9 @@ class SessionStore {
       const envId = opts?.env
         ? (opts.env as Record<string, string>)["VSCODE_CC_ID"]
         : undefined;
-      log(`  terminal "${t.name}" — creationOptions.env.VSCODE_CC_ID=${envId ?? "(none)"}`);
+      log(
+        `  terminal "${t.name}" — creationOptions.env.VSCODE_CC_ID=${envId ?? "(none)"}`,
+      );
     }
 
     const boundTerminals = new Set<vscode.Terminal>();
@@ -599,7 +612,9 @@ class SessionStore {
         this.bindLegacyMatchedTerminal(data, hit);
         persistedById.delete(data.id);
         boundTerminals.add(hit);
-        log(`Matched ${data.id} by customName "${data.customName}" → "${hit.name}"`);
+        log(
+          `Matched ${data.id} by customName "${data.customName}" → "${hit.name}"`,
+        );
       }
     }
 
@@ -697,10 +712,7 @@ class SessionStore {
     // .prompt are transient and would lie now; reset .state and unlink
     // .prompt so cold sessions don't show stale data.
     try {
-      fs.writeFileSync(
-        path.join(STATE_DIR, `${s.id}.state`),
-        "IDLE\n",
-      );
+      fs.writeFileSync(path.join(STATE_DIR, `${s.id}.state`), "IDLE\n");
     } catch (e) {
       /* ignore */
     }
@@ -824,9 +836,59 @@ class SessionStore {
         // Persistent field changed but state didn't — still save (cheap)
         this.save();
       }
+
+      // Liveness fallback for stuck BUSY. An Esc interrupt fires NO hook event
+      // (and crashes/kills miss Stop too), so a turn can end with the state
+      // frozen at BUSY forever. If BUSY has gone silent past the timeout and no
+      // tool is in flight, recover it to IDLE.
+      this.recoverStuckBusy(session, stateFile, now);
     }, 100);
 
     session.pollInterval = pollInterval;
+  }
+
+  // See the call site. Only acts on a BUSY session whose state file AND
+  // transcript have been silent longer than busyTimeout, and only when the
+  // transcript tail shows no tool in flight (a real tool may run for minutes).
+  private recoverStuckBusy(
+    session: Session,
+    stateFile: string,
+    now: number,
+  ): void {
+    if (session.state !== ClaudeState.Busy) return;
+    const timeoutSec = vscode.workspace
+      .getConfiguration("claudeCodeStatus")
+      .get<number>("busyTimeout", 150);
+    if (!timeoutSec || timeoutSec <= 0) return; // disabled
+
+    const txPath = session.transcriptPath;
+    const lastActivity = Math.max(
+      safeMtimeMs(stateFile),
+      txPath ? safeMtimeMs(txPath) : 0,
+    );
+    if (!lastActivity || now - lastActivity <= timeoutSec * 1000) return;
+
+    // Past the timeout — protect a legitimately long-running tool call.
+    if (
+      txPath &&
+      classifyBusyTail(readTailLines(txPath, 32 * 1024, 25)) ===
+        "tool-in-flight"
+    ) {
+      return;
+    }
+
+    log(
+      `Recovering stuck BUSY ${session.id} (silent ${Math.round((now - lastActivity) / 1000)}s, no tool in flight) → IDLE`,
+    );
+    session.state = ClaudeState.Idle;
+    session.permsEnteredAt = undefined;
+    try {
+      fs.writeFileSync(stateFile, "IDLE\n");
+    } catch (e) {
+      /* ignore */
+    }
+    this.emitter.fire();
+    updateStatusBar();
   }
 
   private stopWatching(session: Session): void {
@@ -894,9 +956,7 @@ class CommandChannel {
   }
 
   private handle(takenPath: string): void {
-    const nonce = path
-      .basename(takenPath)
-      .replace(/\.taken$/, "");
+    const nonce = path.basename(takenPath).replace(/\.taken$/, "");
     const resPath = path.join(this.cmdDir, `${nonce}.res`);
 
     let raw: string;
@@ -1031,7 +1091,8 @@ class CommandChannel {
   ): Record<string, unknown> {
     const target = this.resolveSource(from, args);
     if (!target) throw new Error("target session not found in this window");
-    const newName = typeof args.new_name === "string" ? args.new_name : undefined;
+    const newName =
+      typeof args.new_name === "string" ? args.new_name : undefined;
     if (!newName) throw new Error("missing --name");
     this.store.update(target.id, { customName: newName });
     if (
@@ -1143,6 +1204,44 @@ function repairWorktreeDrift(directory: string): string {
   return directory.slice(0, idx);
 }
 
+// File mtime in epoch ms, or 0 if it can't be stat'd.
+function safeMtimeMs(filePath: string): number {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// Read the last `maxLines` non-empty lines from the tail of a file, reading at
+// most `maxBytes` from the end (transcripts can be large; only the tail is
+// needed). Returns [] if unreadable.
+function readTailLines(
+  filePath: string,
+  maxBytes: number,
+  maxLines: number,
+): string[] {
+  try {
+    const size = fs.statSync(filePath).size;
+    const start = Math.max(0, size - maxBytes);
+    const len = size - start;
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      return buf
+        .toString("utf8")
+        .split("\n")
+        .filter((l) => l.trim())
+        .slice(-maxLines);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {
+    return [];
+  }
+}
+
 // Generic sidecar reader. Returns undefined if the file doesn't exist or
 // can't be read. Caller decides how to interpret the trimmed content.
 function readSidecar(ccId: string, suffix: string): string | undefined {
@@ -1201,7 +1300,9 @@ class ClaudeTerminalsProvider
 
   getTreeItem(session: Session): vscode.TreeItem {
     const label =
-      session.customName || session.displayName || `Claude ${session.id.slice(-6)}`;
+      session.customName ||
+      session.displayName ||
+      `Claude ${session.id.slice(-6)}`;
 
     const item = new vscode.TreeItem(
       label,
@@ -1249,7 +1350,7 @@ class ClaudeTerminalsProvider
             "sync~spin",
             new vscode.ThemeColor("warningForeground"),
           );
-          statePrefix = "🟡 BUSY";
+          statePrefix = "⏳ BUSY";
           item.contextValue = "terminal-warm";
           break;
         case ClaudeState.Waiting:
@@ -1275,10 +1376,11 @@ class ClaudeTerminalsProvider
       }
     }
 
-    const promptPreview = !isCold && session.lastPrompt
-      ? session.lastPrompt.slice(0, 50) +
-        (session.lastPrompt.length > 50 ? "..." : "")
-      : "";
+    const promptPreview =
+      !isCold && session.lastPrompt
+        ? session.lastPrompt.slice(0, 50) +
+          (session.lastPrompt.length > 50 ? "..." : "")
+        : "";
     const subagentBadge =
       !isCold && session.subagentCount > 0
         ? ` · ${session.subagentCount} sub`
@@ -1291,7 +1393,9 @@ class ClaudeTerminalsProvider
     md.appendMarkdown(`**${label}**\n\n`);
     md.appendMarkdown(`**State:** ${statePrefix}`);
     if (!isCold && session.subagentCount > 0) {
-      md.appendMarkdown(` · ${session.subagentCount} subagent${session.subagentCount === 1 ? "" : "s"}`);
+      md.appendMarkdown(
+        ` · ${session.subagentCount} subagent${session.subagentCount === 1 ? "" : "s"}`,
+      );
     }
     md.appendMarkdown(`\n\n`);
     md.appendMarkdown(`**Directory:** \`${session.directory}\`\n\n`);
@@ -1303,7 +1407,9 @@ class ClaudeTerminalsProvider
       md.appendMarkdown(`**Now in:** \`${session.currentCwd}\`\n\n`);
     }
     if (session.claudeSessionId || session.claudeVersion) {
-      const v = session.claudeVersion ? session.claudeVersion.replace(/\s*\(Claude Code\)\s*$/, "") : undefined;
+      const v = session.claudeVersion
+        ? session.claudeVersion.replace(/\s*\(Claude Code\)\s*$/, "")
+        : undefined;
       const sidTail = session.claudeSessionId
         ? session.claudeSessionId.slice(-8)
         : undefined;
@@ -1441,10 +1547,7 @@ class SessionEditorPanel {
     if (newName !== (this.session.customName || "")) {
       update.customName = newName || undefined;
     }
-    if (
-      patch.directory &&
-      patch.directory !== this.session.directory
-    ) {
+    if (patch.directory && patch.directory !== this.session.directory) {
       update.directory = patch.directory;
     }
     if (Object.keys(update).length > 0) {
@@ -1467,9 +1570,7 @@ class SessionEditorPanel {
     const s = this.session;
     const cs = s.claudeSessionId || "";
     const cv = (s.claudeVersion || "").replace(/\s*\(Claude Code\)\s*$/, "");
-    const created = s.createdAt
-      ? new Date(s.createdAt).toLocaleString()
-      : "";
+    const created = s.createdAt ? new Date(s.createdAt).toLocaleString() : "";
     const parent = s.parentDisplayName || "";
     const esc = htmlEscape;
 
@@ -1818,7 +1919,11 @@ export function activate(context: vscode.ExtensionContext): void {
           const name = session.customName || session.displayName;
           const choice = await vscode.window.showWarningMessage(
             `Delete session "${name}"?`,
-            { modal: true, detail: "Removes the panel record and sidecar files. The Claude conversation transcript stays on disk." },
+            {
+              modal: true,
+              detail:
+                "Removes the panel record and sidecar files. The Claude conversation transcript stays on disk.",
+            },
             "Delete",
           );
           if (choice !== "Delete") return;
@@ -1835,10 +1940,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const openEditor = (session: Session) =>
     SessionEditorPanel.show(store, session);
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "claudeCodeStatus.editSession",
-      openEditor,
-    ),
+    vscode.commands.registerCommand("claudeCodeStatus.editSession", openEditor),
   );
   context.subscriptions.push(
     vscode.commands.registerCommand(
@@ -1888,7 +1990,9 @@ export function activate(context: vscode.ExtensionContext): void {
           if (choice === "New Terminal") {
             vscode.commands.executeCommand("claudeCodeStatus.newTerminal");
           } else if (choice === "New (Resume)") {
-            vscode.commands.executeCommand("claudeCodeStatus.newTerminalResume");
+            vscode.commands.executeCommand(
+              "claudeCodeStatus.newTerminalResume",
+            );
           }
           return;
         }
@@ -1910,9 +2014,7 @@ export function activate(context: vscode.ExtensionContext): void {
         });
 
         allTerminals.forEach((terminal) => {
-          const session = store
-            .all()
-            .find((s) => s.terminal === terminal);
+          const session = store.all().find((s) => s.terminal === terminal);
           if (session) {
             const config = STATE_CONFIG[session.state];
             const needsAttention = session.state === ClaudeState.Permissions;

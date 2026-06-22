@@ -28,7 +28,10 @@ INPUT=$(cat 2>/dev/null) || exit 0
 if command -v jq &>/dev/null; then
     HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
     PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
-    NOTIFICATION=$(echo "$INPUT" | jq -r '.notification // empty' 2>/dev/null)
+    # Claude Code sends the notification kind in `.notification_type`
+    # (e.g. "permission_prompt", "idle_prompt"); older builds used
+    # `.notification`. Read the real field first, fall back for safety.
+    NOTIFICATION=$(echo "$INPUT" | jq -r '.notification_type // .notification // empty' 2>/dev/null)
     TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
     SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
     CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
@@ -118,8 +121,14 @@ case "$HOOK_EVENT" in
         # (idle_prompt / permission_prompt) matcher names are recognized so
         # the hook keeps working before the user re-runs install-hooks.sh.
         case "$NOTIFICATION" in
-            waiting_for_user_action|permission_prompt)
+            waiting_for_user_action)
                 STATE="WAITING"
+                ;;
+            permission_prompt)
+                # Fires for BOTH a permission dialog and AskUserQuestion, so it
+                # can't tell PERMS from WAITING. PermissionRequest already set
+                # the precise state moments earlier — don't clobber it.
+                exit 0
                 ;;
             idle_timeout|idle_prompt|auth_success)
                 STATE="IDLE"
@@ -132,7 +141,9 @@ case "$HOOK_EVENT" in
                 STATE="IDLE"
                 ;;
             *)
-                STATE="IDLE"
+                # Unknown notification kind — a display nudge, not a known
+                # state transition. Do NOT clobber the current state.
+                exit 0
                 ;;
         esac
         ;;

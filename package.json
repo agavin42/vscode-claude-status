@@ -91,6 +91,11 @@
           "command": "claudeCodeStatus.newTerminal",
           "when": "view == claudeTerminals",
           "group": "navigation"
+        },
+        {
+          "command": "claudeCodeStatus.openDashboard",
+          "when": "view == claudeTerminals",
+          "group": "navigation"
         }
       ]
     },
@@ -157,6 +162,11 @@
         "command": "claudeCodeStatus.reconnectRemoteControl",
         "title": "Reconnect Remote Control",
         "icon": "$(plug)"
+      },
+      {
+        "command": "claudeCodeStatus.openDashboard",
+        "title": "Claude Code: Sessions & PRs",
+        "icon": "$(table)"
       }
     ],
     "keybindings": [

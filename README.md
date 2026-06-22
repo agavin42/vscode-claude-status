@@ -16,6 +16,7 @@ VS Code extension for tracking Claude Code terminal status. Shows a **Claude Ses
 - **Drag & Drop Reorder**: Arrange terminals in your preferred order
 - **Inline Actions**: Rename (pencil) and Close (trash) buttons
 - **State Persistence**: Terminal tracking survives VS Code reload
+- **Sessions & PRs Dashboard**: A full editor tab (table icon in the panel title, or **Claude Code: Sessions & PRs**) listing every session with the pull requests it created. PRs are auto-tied when a session runs `gh pr create` (detected forward via the hook + retroactively by scanning the transcript), or added manually. Each PR carries a lifecycle status — `drafting → shipit·N → finalized-draft → finalizing → reviewable → fixing → merged → deployed → done` — resolved from a stored checkpoint plus live `gh pr view` facts (polled while the tab is focused). Sessions with no PRs show a manual lifecycle status (`simple…implemented`).
 
 ## Quick Start
 
@@ -66,11 +67,12 @@ The terminal will appear in the Claude Sessions panel and show live status updat
 
 ## Commands
 
-| Command                            | Keybinding  | Description                          |
-| ---------------------------------- | ----------- | ------------------------------------ |
-| Claude Code: New Terminal          | Cmd+Shift+C | Create new tracked Claude terminal   |
-| Claude Code: New Terminal (Resume) | —           | Create terminal with `--resume` flag |
-| Claude Code: Show Terminals        | —           | Quick pick of all terminals          |
+| Command                            | Keybinding  | Description                                   |
+| ---------------------------------- | ----------- | --------------------------------------------- |
+| Claude Code: New Terminal          | Cmd+Shift+C | Create new tracked Claude terminal            |
+| Claude Code: New Terminal (Resume) | —           | Create terminal with `--resume` flag          |
+| Claude Code: Show Terminals        | —           | Quick pick of all terminals                   |
+| Claude Code: Sessions & PRs        | —           | Open the dashboard tab (sessions + their PRs) |
 
 ## Configuration
 
@@ -94,29 +96,29 @@ The terminal will appear in the Claude Sessions panel and show live status updat
 
 ### Hook Events → States
 
-| Hook Event          | Condition             | State / Effect                              |
-| ------------------- | --------------------- | ------------------------------------------- |
-| `PreToolUse`        | —                     | BUSY                                        |
-| `PostToolUse`       | —                     | BUSY                                        |
-| `PermissionRequest` | `AskUserQuestion`     | WAITING                                     |
-| `PermissionRequest` | (other tools)         | PERMS                                       |
-| `PermissionDenied`  | —                     | IDLE (clears PERMS without timeout)        |
-| `UserPromptSubmit`  | —                     | BUSY                                        |
-| `Stop`              | —                     | IDLE                                        |
-| `StopFailure`       | —                     | IDLE                                        |
-| `Notification`      | `permission_prompt`   | WAITING                                     |
-| `Notification`      | `idle_prompt`         | IDLE                                        |
-| `Notification`      | `elicitation_dialog`  | WAITING                                     |
-| `Notification`      | `auth_success`        | IDLE                                        |
-| `SessionStart`      | —                     | IDLE; captures `claude --version`           |
-| `SessionEnd`        | —                     | cleanup of all sidecar files                |
-| `CwdChanged`        | —                     | updates `.cwd` (no state change)            |
-| `PreCompact`        | —                     | BUSY                                        |
-| `PostCompact`       | —                     | IDLE; refreshes `session_id`                |
-| `SubagentStart`     | —                     | increments subagent counter                 |
-| `SubagentStop`      | —                     | decrements subagent counter                 |
+| Hook Event          | Condition            | State / Effect                      |
+| ------------------- | -------------------- | ----------------------------------- |
+| `PreToolUse`        | —                    | BUSY                                |
+| `PostToolUse`       | —                    | BUSY                                |
+| `PermissionRequest` | `AskUserQuestion`    | WAITING                             |
+| `PermissionRequest` | (other tools)        | PERMS                               |
+| `PermissionDenied`  | —                    | IDLE (clears PERMS without timeout) |
+| `UserPromptSubmit`  | —                    | BUSY                                |
+| `Stop`              | —                    | IDLE                                |
+| `StopFailure`       | —                    | IDLE                                |
+| `Notification`      | `permission_prompt`  | WAITING                             |
+| `Notification`      | `idle_prompt`        | IDLE                                |
+| `Notification`      | `elicitation_dialog` | WAITING                             |
+| `Notification`      | `auth_success`       | IDLE                                |
+| `SessionStart`      | —                    | IDLE; captures `claude --version`   |
+| `SessionEnd`        | —                    | cleanup of all sidecar files        |
+| `CwdChanged`        | —                    | updates `.cwd` (no state change)    |
+| `PreCompact`        | —                    | BUSY                                |
+| `PostCompact`       | —                    | IDLE; refreshes `session_id`        |
+| `SubagentStart`     | —                    | increments subagent counter         |
+| `SubagentStop`      | —                    | decrements subagent counter         |
 
-Every event also writes (when present in the payload) `session_id` → `{ccId}.session`, `cwd` → `{ccId}.cwd`, `transcript_path` → `{ccId}.tx`. These are guaranteed-present fields per the Claude Code docs.
+Every event also writes (when present in the payload) `session_id` → `{ccId}.session`, `cwd` → `{ccId}.cwd`, `transcript_path` → `{ccId}.tx`. These are guaranteed-present fields per the Claude Code docs. A `PostToolUse` Bash event that ran `gh pr create` also appends the new PR's URL to `{ccId}.prs.log`, which the Sessions & PRs dashboard reconciles into tracked PR records (the dashboard also writes a `{ccId}.prs.scanned` marker to avoid re-scanning an unchanged transcript).
 
 The hook tolerates both new (`permission_prompt`, `idle_prompt`) and legacy (`waiting_for_user_action`, `idle_timeout`) Notification matcher names so a stale `~/.claude/settings.json` won't silently drop events. Re-run `./scripts/install-hooks.sh` to switch to the current matcher names.
 

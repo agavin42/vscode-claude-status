@@ -1,5 +1,5 @@
 ---
-description: Control the Claude Code Status panel — sibling, fork, heal, remake, rename, list, get
+description: Control the Claude Code Status panel — sibling, fork, heal, remake, rename, list, get, pr-status
 argument-hint: <subcommand> [args]
 ---
 
@@ -13,9 +13,11 @@ Presentation rules by subcommand:
 - **`get`** — render as a key-value list. Include every field returned. Truncate `lastPrompt` to ~200 chars with `…` if longer.
 - **`sibling`, `fork`** — confirm the new session: report its name, id (short), directory, and (for fork) parent session. One short paragraph.
 - **`heal`, `remake`, `rename`** — confirm the action took, in one line. Include the target session's name.
+- **`pr-status`** — confirm the PR's checkpoint was recorded, in one line: include the PR url and the new checkpoint.
 - **Any error** — surface the error message verbatim in code-fence format. Do not paraphrase.
 
 Available subcommands:
+
 - `sibling [--name NAME]` — spawn a new session in the same directory (cold start, new conversation)
 - `fork [--name NAME]` — fork this session into a new one that inherits the conversation up to now, then diverges
 - `heal [--name NAME-OF-TARGET]` — send `/remote-control` to a sibling whose link dropped
@@ -23,5 +25,6 @@ Available subcommands:
 - `rename --name NEW_NAME` — rename this session
 - `list` — list all sessions in the current VS Code window
 - `get [--name NAME-OF-TARGET]` — print one session's full record
+- `pr-status --pr URL --checkpoint CP [--stage N]` — report a PR's workflow checkpoint to the Sessions & PRs dashboard (CP: drafting, shipit, shipit-done, reviewable, deployed, done)
 
 Self is targeted by default via `$VSCODE_CC_ID`. To target a sibling, pass `--name` or `--id`.

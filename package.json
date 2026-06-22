@@ -208,6 +208,11 @@
           "default": true,
           "description": "Show a confirmation dialog before deleting a session from the panel. Disable to one-click delete."
         },
+        "claudeCodeStatus.ghPath": {
+          "type": "string",
+          "default": "gh",
+          "description": "Path to the GitHub CLI (`gh`) used to refresh PR statuses in the Sessions & PRs dashboard. If `gh` isn't on the extension host's PATH, set an absolute path here."
+        },
         "claudeCodeStatus.busyTimeout": {
           "type": "number",
           "default": 150,

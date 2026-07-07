@@ -18,6 +18,53 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "colors": [
+      {
+        "id": "claudeCodeStatus.recency0",
+        "description": "Most recently active Claude session (brightest)",
+        "defaults": {
+          "dark": "#FFFF00",
+          "light": "#6B4E00",
+          "highContrast": "#FFFF00"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency1",
+        "description": "2nd most recently active Claude session",
+        "defaults": {
+          "dark": "#FFFF4D",
+          "light": "#806012",
+          "highContrast": "#FFFF4D"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency2",
+        "description": "3rd most recently active Claude session",
+        "defaults": {
+          "dark": "#FFFF99",
+          "light": "#957324",
+          "highContrast": "#FFFF99"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency3",
+        "description": "4th most recently active Claude session",
+        "defaults": {
+          "dark": "#FFFFCC",
+          "light": "#AA8636",
+          "highContrast": "#FFFFCC"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency4",
+        "description": "5th most recently active Claude session (faintest)",
+        "defaults": {
+          "dark": "#FFFFF2",
+          "light": "#BF9948",
+          "highContrast": "#FFFFF2"
+        }
+      }
+    ],
     "views": {
       "scm": [
         {

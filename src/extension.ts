@@ -73,6 +73,10 @@ interface PersistedSession {
   // the transient transcriptPath) so the retroactive PR scanner can reach a
   // cold session's transcript without re-deriving the path from the launch cwd.
   lastTranscriptPath?: string;
+  // Epoch ms of the session's most recent hook activity (any state-file write —
+  // includes every prompt typed). Drives the recency color ramp. Persisted so
+  // the glow survives a window reload.
+  lastActivityAt?: number;
 }
 
 // Runtime Session — persistent fields plus transient state. The terminal field
@@ -95,6 +99,10 @@ interface Session extends PersistedSession {
   // Set true for the brief window during remake() so handleTerminalClose
   // knows the old-terminal dispose belongs to a remake, not a suspend.
   _remaking?: boolean;
+  // Last observed mtime of the .state file; used to detect hook activity
+  // (the hook rewrites .state on every event that sets a state, so its mtime
+  // advances on essentially every hook fire). Transient.
+  _lastStateMtime?: number;
 }
 
 // Legacy persisted shape — what shipped before Phase 2. Used only by the
@@ -116,6 +124,10 @@ class SessionStore {
   private prs = new Map<string, SessionPr[]>();
   private readonly emitter = new vscode.EventEmitter<void>();
   readonly onDidChange = this.emitter.event;
+  // ccId currently at the head of the MRU ordering. Tracked so noteActivity
+  // can skip firing a refresh when the already-most-recent session stays
+  // active (no ranking change → no visual change).
+  private mruHead?: string;
 
   constructor(private readonly ctx: vscode.ExtensionContext) {}
 
@@ -133,6 +145,27 @@ class SessionStore {
 
   warmOnly(): Session[] {
     return this.all().filter((s) => s.terminal !== undefined);
+  }
+
+  // Warm sessions ranked most-recently-active first (only those with a
+  // recorded lastActivityAt). Drives the recency color ramp.
+  recencyRanked(): Session[] {
+    return this.warmOnly()
+      .filter((s) => s.lastActivityAt !== undefined)
+      .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+  }
+
+  // Record hook activity for a session (a .state write — includes every typed
+  // prompt). Bumps lastActivityAt always; fires a refresh only when the MRU
+  // head changes, since that's the only case where the color ranking shifts.
+  noteActivity(id: string): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    s.lastActivityAt = Date.now();
+    if (this.mruHead === id) return; // already most-recent → colors unchanged
+    this.mruHead = id;
+    this.save(); // persist the new ordering (infrequent — once per switch)
+    this.emitter.fire();
   }
 
   // ----- mutations (always save) -----
@@ -709,6 +742,7 @@ class SessionStore {
       createdAt: s.createdAt,
       sessionStatus: s.sessionStatus,
       lastTranscriptPath: s.lastTranscriptPath,
+      lastActivityAt: s.lastActivityAt,
     }));
     // PR records as a plain ccId→SessionPr[] record. An older binary on
     // rollback simply ignores this unknown key (no legacy mirror needed).
@@ -999,10 +1033,22 @@ class SessionStore {
 
   private watchSession(session: Session): void {
     const stateFile = path.join(STATE_DIR, `${session.id}.state`);
+    // Seed the mtime baseline so binding an already-active session doesn't
+    // register as fresh activity on the first poll.
+    session._lastStateMtime = safeMtimeMs(stateFile);
     const pollInterval = setInterval(() => {
       if (!this.sessions.has(session.id)) {
         clearInterval(pollInterval);
         return;
+      }
+
+      // Recency: any .state write is a hook fire (includes every typed
+      // prompt). When its mtime advances, note the activity — this drives
+      // the recency color ramp regardless of whether the state value changed.
+      const stateMtime = safeMtimeMs(stateFile);
+      if (stateMtime > (session._lastStateMtime ?? 0)) {
+        session._lastStateMtime = stateMtime;
+        this.noteActivity(session.id);
       }
 
       const newState = parseStateFile(stateFile);
@@ -1724,6 +1770,55 @@ function readSidecar(ccId: string, suffix: string): string | undefined {
   }
 }
 
+// Synthetic URI identifying a session for the FileDecorationProvider. Custom
+// scheme so it's never treated as a real file (no git/file-icon lookups).
+function sessionUri(ccId: string): vscode.Uri {
+  return vscode.Uri.from({ scheme: "claude-session", path: `/${ccId}` });
+}
+
+// Number of most-recent sessions that get the recency color ramp. Matches the
+// count of registered claudeCodeStatus.recency{0..N-1} theme colors.
+const RECENCY_RAMP_SIZE = 5;
+
+// Colors session names by how recently each was active: the most-recent warm
+// session gets recency0 (pure yellow on dark), fading to near-white by
+// recency4, and no decoration (default foreground) beyond that. This is the
+// only way to color a TreeItem label — VS Code has no direct label-color API,
+// and decoration colors must be registered ThemeColors, hence a 5-step ramp
+// rather than a continuous gradient. Cold sessions never glow.
+class SessionRecencyDecorationProvider
+  implements vscode.FileDecorationProvider
+{
+  private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri[]>();
+  readonly onDidChangeFileDecorations = this._onDidChange.event;
+  private rankByCcId = new Map<string, number>();
+
+  constructor(private readonly store: SessionStore) {
+    this.recompute();
+    store.onDidChange(() => this.refresh());
+  }
+
+  private recompute(): void {
+    this.rankByCcId.clear();
+    this.store.recencyRanked().forEach((s, i) => this.rankByCcId.set(s.id, i));
+  }
+
+  refresh(): void {
+    this.recompute();
+    this._onDidChange.fire(this.store.all().map((s) => sessionUri(s.id)));
+  }
+
+  provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
+    if (uri.scheme !== "claude-session") return undefined;
+    const ccId = uri.path.replace(/^\//, "");
+    const rank = this.rankByCcId.get(ccId);
+    if (rank === undefined || rank >= RECENCY_RAMP_SIZE) return undefined;
+    return {
+      color: new vscode.ThemeColor(`claudeCodeStatus.recency${rank}`),
+    };
+  }
+}
+
 // TreeView provider — talks to the store, never mutates it. Drag-drop calls
 // store.reorder which handles persistence.
 class ClaudeTerminalsProvider
@@ -1778,6 +1873,10 @@ class ClaudeTerminalsProvider
       label,
       vscode.TreeItemCollapsibleState.None,
     );
+    // Drives the recency color ramp via SessionRecencyDecorationProvider.
+    // The explicit label + iconPath below still win over any URI-derived
+    // basename/file-icon, so this only contributes the decoration color.
+    item.resourceUri = sessionUri(session.id);
 
     const isCold = session.terminal === undefined;
     let statePrefix = "";
@@ -2723,6 +2822,13 @@ export function activate(context: vscode.ExtensionContext): void {
     canSelectMany: false,
   });
   context.subscriptions.push(treeView);
+
+  // Recency color ramp on session names (yellow = most recent → white).
+  context.subscriptions.push(
+    vscode.window.registerFileDecorationProvider(
+      new SessionRecencyDecorationProvider(store),
+    ),
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand(

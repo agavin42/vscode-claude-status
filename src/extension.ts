@@ -1770,6 +1770,19 @@ function readSidecar(ccId: string, suffix: string): string | undefined {
   }
 }
 
+// Human-readable "time since" for the last-activity tooltip line, e.g.
+// "just now", "12s ago", "5m ago", "2h ago", "3d ago".
+function formatAgo(fromMs: number, nowMs: number): string {
+  const s = Math.max(0, Math.round((nowMs - fromMs) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 // Synthetic URI identifying a session for the FileDecorationProvider. Custom
 // scheme so it's never treated as a real file (no git/file-icon lookups).
 function sessionUri(ccId: string): vscode.Uri {
@@ -1989,6 +2002,12 @@ class ClaudeTerminalsProvider
     }
     if (session.parentDisplayName) {
       md.appendMarkdown(`**Forked from:** ${session.parentDisplayName}\n\n`);
+    }
+    if (session.lastActivityAt) {
+      const when = new Date(session.lastActivityAt).toLocaleTimeString();
+      md.appendMarkdown(
+        `**Last active:** ${formatAgo(session.lastActivityAt, Date.now())} (${when})\n\n`,
+      );
     }
     if (!isCold && session.lastPrompt) {
       md.appendMarkdown(`**Last prompt:** ${session.lastPrompt}\n\n`);

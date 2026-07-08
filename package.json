@@ -79,70 +79,100 @@
       "view/item/context": [
         {
           "command": "claudeCodeStatus.editSession",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "inline@1"
         },
         {
           "command": "claudeCodeStatus.remakeTerminal",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "inline@2"
         },
         {
           "command": "claudeCodeStatus.delete",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "inline@3"
         },
         {
           "command": "claudeCodeStatus.editSession",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "1_edit@1"
         },
         {
           "command": "claudeCodeStatus.remakeTerminal",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "1_edit@2"
         },
         {
           "command": "claudeCodeStatus.focusTerminal",
-          "when": "view == claudeTerminals && viewItem != terminal-cold",
+          "when": "view == claudeTerminals && viewItem != terminal-cold && viewItem != folder",
           "group": "1_edit@3"
         },
         {
+          "command": "claudeCodeStatus.moveToFolder",
+          "when": "view == claudeTerminals && viewItem != folder",
+          "group": "1_edit@4"
+        },
+        {
           "command": "claudeCodeStatus.newSibling",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "2_spawn@1"
         },
         {
           "command": "claudeCodeStatus.fork",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "2_spawn@2"
         },
         {
           "command": "claudeCodeStatus.reconnectRemoteControl",
-          "when": "view == claudeTerminals && viewItem != terminal-cold && claudeCodeStatus.remoteControlEnabled",
+          "when": "view == claudeTerminals && viewItem != terminal-cold && viewItem != folder && claudeCodeStatus.remoteControlEnabled",
           "group": "2_spawn@3"
         },
         {
           "command": "claudeCodeStatus.suspend",
-          "when": "view == claudeTerminals && viewItem != terminal-cold",
+          "when": "view == claudeTerminals && viewItem != terminal-cold && viewItem != folder",
           "group": "9_destructive@1"
         },
         {
           "command": "claudeCodeStatus.delete",
-          "when": "view == claudeTerminals",
+          "when": "view == claudeTerminals && viewItem != folder",
           "group": "9_destructive@2"
+        },
+        {
+          "command": "claudeCodeStatus.renameFolder",
+          "when": "view == claudeTerminals && viewItem == folder",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeStatus.deleteFolder",
+          "when": "view == claudeTerminals && viewItem == folder",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeStatus.renameFolder",
+          "when": "view == claudeTerminals && viewItem == folder",
+          "group": "1_folder@1"
+        },
+        {
+          "command": "claudeCodeStatus.deleteFolder",
+          "when": "view == claudeTerminals && viewItem == folder",
+          "group": "1_folder@2"
         }
       ],
       "view/title": [
         {
+          "command": "claudeCodeStatus.newFolder",
+          "when": "view == claudeTerminals",
+          "group": "navigation@1"
+        },
+        {
           "command": "claudeCodeStatus.newTerminal",
           "when": "view == claudeTerminals",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "claudeCodeStatus.openDashboard",
           "when": "view == claudeTerminals",
-          "group": "navigation"
+          "group": "navigation@3"
         }
       ]
     },
@@ -209,6 +239,26 @@
         "command": "claudeCodeStatus.reconnectRemoteControl",
         "title": "Reconnect Remote Control",
         "icon": "$(plug)"
+      },
+      {
+        "command": "claudeCodeStatus.newFolder",
+        "title": "Claude Code: New Folder",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "claudeCodeStatus.renameFolder",
+        "title": "Rename Folder",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "claudeCodeStatus.deleteFolder",
+        "title": "Delete Folder",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claudeCodeStatus.moveToFolder",
+        "title": "Move to Folder…",
+        "icon": "$(folder)"
       },
       {
         "command": "claudeCodeStatus.openDashboard",

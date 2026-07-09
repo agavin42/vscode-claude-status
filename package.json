@@ -32,36 +32,63 @@
         "id": "claudeCodeStatus.recency1",
         "description": "2nd most recently active Claude session",
         "defaults": {
-          "dark": "#FFFF4D",
-          "light": "#806012",
-          "highContrast": "#FFFF4D"
+          "dark": "#FFFF22",
+          "light": "#785B0E",
+          "highContrast": "#FFFF22"
         }
       },
       {
         "id": "claudeCodeStatus.recency2",
         "description": "3rd most recently active Claude session",
         "defaults": {
-          "dark": "#FFFF99",
-          "light": "#957324",
-          "highContrast": "#FFFF99"
+          "dark": "#FFFF44",
+          "light": "#86681B",
+          "highContrast": "#FFFF44"
         }
       },
       {
         "id": "claudeCodeStatus.recency3",
         "description": "4th most recently active Claude session",
         "defaults": {
-          "dark": "#FFFFCC",
-          "light": "#AA8636",
-          "highContrast": "#FFFFCC"
+          "dark": "#FFFF66",
+          "light": "#937529",
+          "highContrast": "#FFFF66"
         }
       },
       {
         "id": "claudeCodeStatus.recency4",
-        "description": "5th most recently active Claude session (faintest)",
+        "description": "5th most recently active Claude session",
         "defaults": {
-          "dark": "#FFFFF2",
-          "light": "#BF9948",
-          "highContrast": "#FFFFF2"
+          "dark": "#FFFF88",
+          "light": "#A18137",
+          "highContrast": "#FFFF88"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency5",
+        "description": "6th most recently active Claude session",
+        "defaults": {
+          "dark": "#FFFFAA",
+          "light": "#AE8E45",
+          "highContrast": "#FFFFAA"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency6",
+        "description": "7th most recently active Claude session",
+        "defaults": {
+          "dark": "#FFFFCC",
+          "light": "#BC9B52",
+          "highContrast": "#FFFFCC"
+        }
+      },
+      {
+        "id": "claudeCodeStatus.recency7",
+        "description": "8th most recently active Claude session (faintest)",
+        "defaults": {
+          "dark": "#FFFFEE",
+          "light": "#C9A860",
+          "highContrast": "#FFFFEE"
         }
       }
     ],

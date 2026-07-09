@@ -1939,14 +1939,15 @@ function sessionUri(ccId: string): vscode.Uri {
 
 // Number of most-recent sessions that get the recency color ramp. Matches the
 // count of registered claudeCodeStatus.recency{0..N-1} theme colors.
-const RECENCY_RAMP_SIZE = 5;
+const RECENCY_RAMP_SIZE = 8;
 
 // Colors session names by how recently each was active: the most-recent warm
 // session gets recency0 (pure yellow on dark), fading to near-white by
-// recency4, and no decoration (default foreground) beyond that. This is the
+// recency7, and no decoration (default foreground) beyond that. This is the
 // only way to color a TreeItem label — VS Code has no direct label-color API,
-// and decoration colors must be registered ThemeColors, hence a 5-step ramp
-// rather than a continuous gradient. Cold sessions never glow.
+// and decoration colors must be registered ThemeColors, hence a discrete
+// RECENCY_RAMP_SIZE-step ramp rather than a continuous gradient. Cold sessions
+// never glow.
 class SessionRecencyDecorationProvider
   implements vscode.FileDecorationProvider
 {

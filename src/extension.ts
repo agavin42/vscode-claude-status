@@ -68,6 +68,7 @@ interface PersistedSession {
   parentSessionId?: string; // for forked sessions (Phase 7)
   parentDisplayName?: string;
   createdAt: number; // epoch ms
+  folderId?: string; // id of the containing folder; undefined = ungrouped
   sessionStatus?: SessionStatus; // manual lifecycle phase; shown only when no PRs
   // Snapshot of the last transcript path the hook reported. Persisted (unlike
   // the transient transcriptPath) so the retroactive PR scanner can reach a
@@ -77,6 +78,23 @@ interface PersistedSession {
   // includes every prompt typed). Drives the recency color ramp. Persisted so
   // the glow survives a window reload.
   lastActivityAt?: number;
+}
+
+// A user-created folder for organizing sessions in the tree. Folders are
+// purely an organizational overlay — they hold no terminal state, only a
+// name + collapse memory. Sessions reference their folder by id (folderId).
+interface Folder {
+  kind: "folder"; // discriminant for the TreeNode union
+  id: string; // f-{ts}-{rand}
+  name: string;
+  collapsed: boolean; // persisted expansion state
+}
+
+// The tree renders a mix of folders (branches) and sessions (leaves).
+type TreeNode = Folder | Session;
+
+function isFolder(node: TreeNode): node is Folder {
+  return (node as Folder).kind === "folder";
 }
 
 // Runtime Session — persistent fields plus transient state. The terminal field
@@ -119,6 +137,7 @@ interface LegacyPersistedTerminal {
 class SessionStore {
   private sessions = new Map<string, Session>();
   private order: string[] = [];
+  private folders: Folder[] = [];
   // PR records keyed by owning ccId. Source of truth (persisted); the
   // .prs.log / .prs.scanned sidecars are reconstructable caches.
   private prs = new Map<string, SessionPr[]>();
@@ -145,6 +164,29 @@ class SessionStore {
 
   warmOnly(): Session[] {
     return this.all().filter((s) => s.terminal !== undefined);
+  }
+
+  // ----- folder queries (pure) -----
+
+  // Folders in display order.
+  folderList(): Folder[] {
+    return this.folders;
+  }
+
+  getFolder(id: string): Folder | undefined {
+    return this.folders.find((f) => f.id === id);
+  }
+
+  // Sessions assigned to a given folder, in global order.
+  sessionsInFolder(folderId: string): Session[] {
+    return this.all().filter((s) => s.folderId === folderId);
+  }
+
+  // Sessions with no folder — or whose folderId points at a folder that no
+  // longer exists (defensive: a stale id renders as ungrouped, never hidden).
+  ungrouped(): Session[] {
+    const live = new Set(this.folders.map((f) => f.id));
+    return this.all().filter((s) => !s.folderId || !live.has(s.folderId));
   }
 
   // Warm sessions ranked most-recently-active first (only those with a
@@ -724,6 +766,94 @@ class SessionStore {
     this.emitter.fire();
   }
 
+  // ----- folder mutations (always save) -----
+
+  createFolder(name: string): Folder {
+    const folder: Folder = {
+      kind: "folder",
+      id: generateFolderId(),
+      name: name.trim() || "New Folder",
+      collapsed: false,
+    };
+    this.folders.push(folder);
+    this.save();
+    this.emitter.fire();
+    log(`Created folder ${folder.id} ("${folder.name}")`);
+    return folder;
+  }
+
+  renameFolder(id: string, name: string): void {
+    const folder = this.getFolder(id);
+    if (!folder) return;
+    folder.name = name.trim() || folder.name;
+    this.save();
+    this.emitter.fire();
+  }
+
+  // Delete a folder. Its sessions are NOT deleted — they fall back to
+  // ungrouped (folderId cleared). Only the organizational container goes.
+  deleteFolder(id: string): void {
+    if (!this.getFolder(id)) return;
+    this.folders = this.folders.filter((f) => f.id !== id);
+    for (const s of this.sessions.values()) {
+      if (s.folderId === id) s.folderId = undefined;
+    }
+    this.save();
+    this.emitter.fire();
+    log(`Deleted folder ${id} (children moved to ungrouped)`);
+  }
+
+  // Persist a folder's expand/collapse state so it survives reload. Saves
+  // without firing onDidChange — VS Code already updated the visual state,
+  // and re-firing would fight the user's interaction.
+  setFolderCollapsed(id: string, collapsed: boolean): void {
+    const folder = this.getFolder(id);
+    if (!folder || folder.collapsed === collapsed) return;
+    folder.collapsed = collapsed;
+    this.save();
+  }
+
+  // Reorder folders relative to one another (folder-on-folder drag).
+  reorderFolder(draggedId: string, targetId: string | undefined): void {
+    const dragged = this.getFolder(draggedId);
+    if (!dragged) return;
+    this.folders = this.folders.filter((f) => f.id !== draggedId);
+    const targetIndex = targetId
+      ? this.folders.findIndex((f) => f.id === targetId)
+      : -1;
+    if (targetIndex >= 0) {
+      this.folders.splice(targetIndex, 0, dragged);
+    } else {
+      this.folders.push(dragged);
+    }
+    this.save();
+    this.emitter.fire();
+  }
+
+  // Assign a session to a folder (or undefined to ungroup it), optionally
+  // positioning it next to a sibling session in the global order. This is
+  // the single entry point for drag-to-folder so assignment + ordering save
+  // together (one fire, no double refresh).
+  moveSession(
+    draggedId: string,
+    opts: { folderId?: string; beforeId?: string } = {},
+  ): void {
+    const s = this.sessions.get(draggedId);
+    if (!s) return;
+    s.folderId = opts.folderId;
+    if (opts.beforeId && opts.beforeId !== draggedId) {
+      this.order = this.order.filter((id) => id !== draggedId);
+      const idx = this.order.indexOf(opts.beforeId);
+      if (idx >= 0) this.order.splice(idx, 0, draggedId);
+      else this.order.push(draggedId);
+    }
+    this.save();
+    this.emitter.fire();
+    log(
+      `Moved session ${draggedId} → folder ${opts.folderId ?? "(ungrouped)"}`,
+    );
+  }
+
   // ----- persistence -----
 
   save(): void {
@@ -740,6 +870,7 @@ class SessionStore {
       parentSessionId: s.parentSessionId,
       parentDisplayName: s.parentDisplayName,
       createdAt: s.createdAt,
+      folderId: s.folderId,
       sessionStatus: s.sessionStatus,
       lastTranscriptPath: s.lastTranscriptPath,
       lastActivityAt: s.lastActivityAt,
@@ -752,9 +883,10 @@ class SessionStore {
     }
     this.ctx.workspaceState.update("trackedTerminals", persisted);
     this.ctx.workspaceState.update("terminalOrder", this.order);
+    this.ctx.workspaceState.update("folders", this.folders);
     this.ctx.workspaceState.update("sessionPrs", prsObj);
     log(
-      `Saved state: ${persisted.length} sessions, order=${this.order.length}, prSessions=${Object.keys(prsObj).length}`,
+      `Saved state: ${persisted.length} sessions, order=${this.order.length}, folders=${this.folders.length}, prSessions=${Object.keys(prsObj).length}`,
     );
   }
 
@@ -770,7 +902,19 @@ class SessionStore {
       [],
     );
 
-    // PR records rehydrate independently of sessions.
+    // Folders are independent of sessions — restore them first so empty
+    // folders survive even when every session was deleted (the early return
+    // below skips session migration but folders are already loaded).
+    this.folders = this.ctx.workspaceState
+      .get<Folder[]>("folders", [])
+      .map((f) => ({
+        kind: "folder",
+        id: f.id,
+        name: f.name,
+        collapsed: !!f.collapsed,
+      }));
+
+    // PR records rehydrate independently of sessions (same as folders).
     const prsObj = this.ctx.workspaceState.get<Record<string, SessionPr[]>>(
       "sessionPrs",
       {},
@@ -1657,6 +1801,10 @@ function generateCcId(): string {
   return `cc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function generateFolderId(): string {
+  return `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function ensureStateDir(): void {
   if (!fs.existsSync(STATE_DIR)) {
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -1833,13 +1981,17 @@ class SessionRecencyDecorationProvider
 }
 
 // TreeView provider — talks to the store, never mutates it. Drag-drop calls
-// store.reorder which handles persistence.
+// store mutations which handle persistence. The tree is two levels deep:
+// folders (branches) + ungrouped sessions at the root, a folder's sessions
+// underneath it.
 class ClaudeTerminalsProvider
   implements
-    vscode.TreeDataProvider<Session>,
-    vscode.TreeDragAndDropController<Session>
+    vscode.TreeDataProvider<TreeNode>,
+    vscode.TreeDragAndDropController<TreeNode>
 {
-  private _onDidChangeTreeData = new vscode.EventEmitter<Session | undefined>();
+  private _onDidChangeTreeData = new vscode.EventEmitter<
+    TreeNode | undefined
+  >();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   readonly dropMimeTypes = ["application/vnd.code.tree.claudeterminals"];
@@ -1854,17 +2006,19 @@ class ClaudeTerminalsProvider
   }
 
   handleDrag(
-    source: readonly Session[],
+    source: readonly TreeNode[],
     dataTransfer: vscode.DataTransfer,
   ): void {
     dataTransfer.set(
       "application/vnd.code.tree.claudeterminals",
-      new vscode.DataTransferItem(source.map((t) => t.id)),
+      // Folder ids (f-) and session ids (cc-) are distinguishable by prefix,
+      // so a single transfer payload covers both drag kinds.
+      new vscode.DataTransferItem(source.map((n) => n.id)),
     );
   }
 
   handleDrop(
-    target: Session | undefined,
+    target: TreeNode | undefined,
     dataTransfer: vscode.DataTransfer,
   ): void {
     const transferItem = dataTransfer.get(
@@ -1873,10 +2027,66 @@ class ClaudeTerminalsProvider
     if (!transferItem) return;
     const draggedIds: string[] = transferItem.value;
     if (!draggedIds || draggedIds.length === 0) return;
-    this.store.reorder(draggedIds[0], target?.id);
+    const draggedId = draggedIds[0];
+
+    // Dragging a folder reorders folders relative to one another. A folder
+    // can only be dropped at the root level (onto another folder or empty
+    // space) — dropping it onto a session is treated as "before that
+    // session's folder", or a no-op for ungrouped targets.
+    if (draggedId.startsWith("f-")) {
+      const targetFolderId = !target
+        ? undefined
+        : isFolder(target)
+          ? target.id
+          : target.folderId;
+      this.store.reorderFolder(draggedId, targetFolderId);
+      return;
+    }
+
+    // Dragging a session. Where it lands decides its folder:
+    //   • onto a folder header  → into that folder
+    //   • onto another session  → same folder as that session, positioned
+    //                             just before it
+    //   • onto empty space      → ungrouped, moved to the end
+    if (!target) {
+      this.store.moveSession(draggedId, { folderId: undefined });
+    } else if (isFolder(target)) {
+      this.store.moveSession(draggedId, { folderId: target.id });
+    } else {
+      this.store.moveSession(draggedId, {
+        folderId: target.folderId,
+        beforeId: target.id,
+      });
+    }
   }
 
-  getTreeItem(session: Session): vscode.TreeItem {
+  getTreeItem(node: TreeNode): vscode.TreeItem {
+    if (isFolder(node)) return this.folderTreeItem(node);
+    return this.sessionTreeItem(node);
+  }
+
+  private folderTreeItem(folder: Folder): vscode.TreeItem {
+    const sessions = this.store.sessionsInFolder(folder.id);
+    const item = new vscode.TreeItem(
+      folder.name,
+      folder.collapsed
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.Expanded,
+    );
+    item.id = folder.id; // stable id so collapse state tracks the folder
+    item.iconPath = new vscode.ThemeIcon("folder");
+    item.contextValue = "folder";
+    const active = sessions.filter((s) => s.terminal !== undefined).length;
+    item.description = `${sessions.length} session${sessions.length === 1 ? "" : "s"}${
+      active ? ` · ${active} live` : ""
+    }`;
+    item.tooltip = new vscode.MarkdownString(
+      `**📁 ${folder.name}**\n\n${sessions.length} session${sessions.length === 1 ? "" : "s"} · ${active} live`,
+    );
+    return item;
+  }
+
+  private sessionTreeItem(session: Session): vscode.TreeItem {
     const label =
       session.customName ||
       session.displayName ||
@@ -2032,9 +2242,22 @@ class ClaudeTerminalsProvider
     return item;
   }
 
-  // Phase 3: tree shows all sessions including cold.
-  getChildren(): Session[] {
-    return store.all();
+  // Root level shows folders first, then ungrouped sessions. A folder's
+  // children are the sessions assigned to it. Sessions are leaves.
+  getChildren(element?: TreeNode): TreeNode[] {
+    if (!element) {
+      return [...this.store.folderList(), ...this.store.ungrouped()];
+    }
+    if (isFolder(element)) {
+      return this.store.sessionsInFolder(element.id);
+    }
+    return [];
+  }
+
+  // Needed for treeView.reveal and correct collapse-state restoration.
+  getParent(node: TreeNode): TreeNode | undefined {
+    if (isFolder(node)) return undefined;
+    return node.folderId ? this.store.getFolder(node.folderId) : undefined;
   }
 }
 
@@ -2836,11 +3059,126 @@ export function activate(context: vscode.ExtensionContext): void {
   claudeTerminalsProvider = new ClaudeTerminalsProvider(store);
   const treeView = vscode.window.createTreeView("claudeTerminals", {
     treeDataProvider: claudeTerminalsProvider,
-    showCollapseAll: false,
+    showCollapseAll: true,
     dragAndDropController: claudeTerminalsProvider,
     canSelectMany: false,
   });
   context.subscriptions.push(treeView);
+
+  // Persist folder expand/collapse so the layout survives reload. Guard on
+  // isFolder — only folders are collapsible, but the event is typed over all
+  // nodes.
+  context.subscriptions.push(
+    treeView.onDidCollapseElement((e) => {
+      if (isFolder(e.element)) store.setFolderCollapsed(e.element.id, true);
+    }),
+    treeView.onDidExpandElement((e) => {
+      if (isFolder(e.element)) store.setFolderCollapsed(e.element.id, false);
+    }),
+  );
+
+  // ----- folder commands -----
+
+  // New Folder — title-bar (+) action and command palette. Prompts for a
+  // name, creates an empty folder; sessions are dragged in afterwards.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeCodeStatus.newFolder", async () => {
+      const name = await vscode.window.showInputBox({
+        prompt: "Folder name",
+        placeHolder: "e.g. Frontend",
+        validateInput: (v) => (v.trim() ? undefined : "Name cannot be empty"),
+      });
+      if (name === undefined) return; // cancelled
+      store.createFolder(name);
+    }),
+  );
+
+  // Rename Folder — inline pencil + context menu. Accepts the folder node
+  // (from the tree) as its argument.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.renameFolder",
+      async (folder: Folder) => {
+        if (!folder || !isFolder(folder)) return;
+        const name = await vscode.window.showInputBox({
+          prompt: "Rename folder",
+          value: folder.name,
+          validateInput: (v) => (v.trim() ? undefined : "Name cannot be empty"),
+        });
+        if (name === undefined) return;
+        store.renameFolder(folder.id, name);
+      },
+    ),
+  );
+
+  // Delete Folder — removes the container only; its sessions fall back to
+  // ungrouped. Confirms when the folder is non-empty.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.deleteFolder",
+      async (folder: Folder) => {
+        if (!folder || !isFolder(folder)) return;
+        const count = store.sessionsInFolder(folder.id).length;
+        if (count > 0) {
+          const choice = await vscode.window.showWarningMessage(
+            `Delete folder "${folder.name}"?`,
+            {
+              modal: true,
+              detail: `Its ${count} session${count === 1 ? "" : "s"} will move back to ungrouped. No sessions are closed or deleted.`,
+            },
+            "Delete Folder",
+          );
+          if (choice !== "Delete Folder") return;
+        }
+        store.deleteFolder(folder.id);
+      },
+    ),
+  );
+
+  // Move to Folder… — keyboard/menu alternative to drag-and-drop. Shows a
+  // quick pick of existing folders plus "New folder…" and "Remove from
+  // folder".
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeCodeStatus.moveToFolder",
+      async (session: Session) => {
+        if (!session) return;
+        const NEW = "$(add) New folder…";
+        const NONE = "$(circle-slash) Remove from folder";
+        const folders = store.folderList();
+        const picks: vscode.QuickPickItem[] = [
+          { label: NEW },
+          ...(session.folderId ? [{ label: NONE }] : []),
+          ...(folders.length
+            ? [{ label: "Folders", kind: vscode.QuickPickItemKind.Separator }]
+            : []),
+          ...folders.map((f) => ({
+            label: f.name,
+            description: f.id === session.folderId ? "current" : undefined,
+          })),
+        ];
+        const choice = await vscode.window.showQuickPick(picks, {
+          placeHolder: `Move "${session.customName || session.displayName}" to…`,
+        });
+        if (!choice) return;
+        if (choice.label === NEW) {
+          const name = await vscode.window.showInputBox({
+            prompt: "New folder name",
+            validateInput: (v) =>
+              v.trim() ? undefined : "Name cannot be empty",
+          });
+          if (name === undefined) return;
+          const folder = store.createFolder(name);
+          store.moveSession(session.id, { folderId: folder.id });
+        } else if (choice.label === NONE) {
+          store.moveSession(session.id, { folderId: undefined });
+        } else {
+          const folder = folders.find((f) => f.name === choice.label);
+          if (folder) store.moveSession(session.id, { folderId: folder.id });
+        }
+      },
+    ),
+  );
 
   // Recency color ramp on session names (yellow = most recent → white).
   context.subscriptions.push(

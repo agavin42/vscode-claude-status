@@ -78,6 +78,10 @@ interface PersistedSession {
   // includes every prompt typed). Drives the recency color ramp. Persisted so
   // the glow survives a window reload.
   lastActivityAt?: number;
+  // Absolute path to an alternate Claude settings file, passed as --settings
+  // on launch. undefined = the default (~/.claude/settings.json, no flag).
+  // Only takes effect on a fresh launch, so changing it needs a remake.
+  settingsFile?: string;
 }
 
 // A user-created folder for organizing sessions in the tree. Folders are
@@ -219,6 +223,7 @@ class SessionStore {
       forkFrom?: string;
       customName?: string;
       parentDisplayName?: string;
+      settingsFile?: string;
     } = {},
   ): Session | undefined {
     ensureStateDir();
@@ -266,6 +271,9 @@ class SessionStore {
     } else {
       launchArgs.push("--session-id", claudeSessionId);
     }
+    if (args.settingsFile) {
+      launchArgs.push("--settings", `"${args.settingsFile}"`);
+    }
     launchArgs.push(...extraArgs);
     if (remoteControl) {
       launchArgs.push("--remote-control", "-n", `"${sessionName}"`);
@@ -285,6 +293,7 @@ class SessionStore {
       claudeSessionId,
       parentSessionId: args.forkFrom,
       parentDisplayName: args.parentDisplayName,
+      settingsFile: args.settingsFile,
       createdAt: Date.now(),
       terminal,
       state: ClaudeState.Idle,
@@ -314,6 +323,7 @@ class SessionStore {
     return this.create({
       dir: src.directory,
       customName: name,
+      settingsFile: src.settingsFile,
     });
   }
 
@@ -333,6 +343,7 @@ class SessionStore {
       forkFrom: src.claudeSessionId,
       customName: name,
       parentDisplayName: src.customName || src.displayName,
+      settingsFile: src.settingsFile,
     });
   }
 
@@ -462,6 +473,9 @@ class SessionStore {
     const sessionName = s.customName || s.displayName;
 
     const launchArgs: string[] = ["--resume", s.claudeSessionId];
+    if (s.settingsFile) {
+      launchArgs.push("--settings", `"${s.settingsFile}"`);
+    }
     launchArgs.push(...extraArgs);
     if (remoteControl) {
       launchArgs.push("--remote-control", "-n", `"${sessionName}"`);
@@ -874,6 +888,7 @@ class SessionStore {
       sessionStatus: s.sessionStatus,
       lastTranscriptPath: s.lastTranscriptPath,
       lastActivityAt: s.lastActivityAt,
+      settingsFile: s.settingsFile,
     }));
     // PR records as a plain ccId→SessionPr[] record. An older binary on
     // rollback simply ignores this unknown key (no legacy mirror needed).
@@ -1772,6 +1787,7 @@ function sessionSummary(s: Session): Record<string, unknown> {
     currentCwd: s.currentCwd,
     claudeSessionId: s.claudeSessionId,
     claudeVersion: s.claudeVersion,
+    settingsFile: s.settingsFile,
     parentSessionId: s.parentSessionId,
     state: s.terminal ? s.state : "cold",
     subagentCount: s.subagentCount,
@@ -1915,6 +1931,37 @@ function readSidecar(ccId: string, suffix: string): string | undefined {
     return fs.readFileSync(filePath, "utf-8").trim();
   } catch (e) {
     return undefined;
+  }
+}
+
+// Where Claude keeps user settings. Alternate settings files are expected to
+// live beside the default one, so that's the directory the picker scans.
+const CLAUDE_SETTINGS_DIR = path.join(os.homedir(), ".claude");
+const DEFAULT_SETTINGS_FILENAME = "settings.json";
+
+// Claude-owned JSON that shares the settings directory but is not a settings
+// file. Offering these in the picker would silently break a session.
+const NON_SETTINGS_JSON = new Set(["policy-limits.json", "remote-settings.json"]);
+
+// Alternate settings files a session can be launched with: every non-hidden
+// .json in the settings directory except the default itself (that IS the
+// "default" choice, launched with no --settings flag) and Claude's own
+// bookkeeping files. Returns absolute paths, sorted by filename.
+function discoverAlternateSettingsFiles(): string[] {
+  try {
+    return fs
+      .readdirSync(CLAUDE_SETTINGS_DIR)
+      .filter(
+        (f) =>
+          f.endsWith(".json") &&
+          !f.startsWith(".") &&
+          f !== DEFAULT_SETTINGS_FILENAME &&
+          !NON_SETTINGS_JSON.has(f),
+      )
+      .sort()
+      .map((f) => path.join(CLAUDE_SETTINGS_DIR, f));
+  } catch (e) {
+    return [];
   }
 }
 
@@ -2214,6 +2261,11 @@ class ClaudeTerminalsProvider
     if (session.parentDisplayName) {
       md.appendMarkdown(`**Forked from:** ${session.parentDisplayName}\n\n`);
     }
+    if (session.settingsFile) {
+      md.appendMarkdown(
+        `**Settings:** \`${path.basename(session.settingsFile)}\`\n\n`,
+      );
+    }
     if (session.lastActivityAt) {
       const when = new Date(session.lastActivityAt).toLocaleTimeString();
       md.appendMarkdown(
@@ -2310,10 +2362,16 @@ class SessionEditorPanel {
         case "browse":
           await this.handleBrowse();
           break;
-        case "save":
-          this.applyPatch(msg.patch || {});
-          this.panel.dispose();
+        case "browseSettings":
+          await this.handleBrowseSettings();
           break;
+        case "save": {
+          const sessionId = this.session.id;
+          const settingsChanged = this.applyPatch(msg.patch || {});
+          this.panel.dispose();
+          if (settingsChanged) await this.offerRemake(sessionId);
+          break;
+        }
         case "saveAndRemake":
           this.applyPatch(msg.patch || {});
           this.store.remake(this.session.id);
@@ -2353,7 +2411,43 @@ class SessionEditorPanel {
     }
   }
 
-  private applyPatch(patch: { customName?: string; directory?: string }): void {
+  private async handleBrowseSettings(): Promise<void> {
+    const result = await vscode.window.showOpenDialog({
+      canSelectFolders: false,
+      canSelectFiles: true,
+      canSelectMany: false,
+      defaultUri: vscode.Uri.file(CLAUDE_SETTINGS_DIR),
+      filters: { "Settings JSON": ["json"] },
+      openLabel: "Use this settings file",
+    });
+    if (result && result[0]) {
+      this.panel.webview.postMessage({
+        type: "settingsSelected",
+        file: result[0].fsPath,
+        label: path.basename(result[0].fsPath),
+      });
+    }
+  }
+
+  // A settings file only binds at launch, so an already-running session keeps
+  // its old one until it is remade. Offer that rather than leaving the panel
+  // showing a value the live process isn't actually using.
+  private async offerRemake(sessionId: string): Promise<void> {
+    const s = this.store.get(sessionId);
+    if (!s || !s.terminal) return; // cold: its next remake picks this up
+    const choice = await vscode.window.showInformationMessage(
+      `Settings file changed for "${s.customName || s.displayName}". Remake now to apply it?`,
+      "Remake now",
+    );
+    if (choice === "Remake now") this.store.remake(sessionId);
+  }
+
+  // Returns true when the settings file changed (the caller may offer a remake).
+  private applyPatch(patch: {
+    customName?: string;
+    directory?: string;
+    settingsFile?: string;
+  }): boolean {
     const update: Partial<PersistedSession> = {};
     const newName = (patch.customName ?? "").trim();
     if (newName !== (this.session.customName || "")) {
@@ -2361,6 +2455,11 @@ class SessionEditorPanel {
     }
     if (patch.directory && patch.directory !== this.session.directory) {
       update.directory = patch.directory;
+    }
+    const newSettings = (patch.settingsFile ?? "").trim();
+    const settingsChanged = newSettings !== (this.session.settingsFile || "");
+    if (settingsChanged) {
+      update.settingsFile = newSettings || undefined;
     }
     if (Object.keys(update).length > 0) {
       this.store.update(this.session.id, update);
@@ -2376,6 +2475,7 @@ class SessionEditorPanel {
     ) {
       this.session.terminal.sendText(`/rename ${update.customName}`);
     }
+    return settingsChanged;
   }
 
   private renderHtml(): string {
@@ -2385,6 +2485,23 @@ class SessionEditorPanel {
     const created = s.createdAt ? new Date(s.createdAt).toLocaleString() : "";
     const parent = s.parentDisplayName || "";
     const esc = htmlEscape;
+
+    // Settings choices: the default (no --settings) plus every alternate file
+    // found beside it. A session already pointing somewhere outside that
+    // directory keeps its entry so the current value is always selectable.
+    const currentSettings = s.settingsFile || "";
+    const found = discoverAlternateSettingsFiles();
+    const choices =
+      currentSettings && !found.includes(currentSettings)
+        ? [...found, currentSettings]
+        : found;
+    const settingsOptions = [
+      `<option value=""${currentSettings ? "" : " selected"}>default (settings.json)</option>`,
+      ...choices.map(
+        (f) =>
+          `<option value="${esc(f)}"${f === currentSettings ? " selected" : ""}>${esc(path.basename(f))}</option>`,
+      ),
+    ].join("\n      ");
 
     const optionalRow = (label: string, value: string): string =>
       value
@@ -2416,7 +2533,7 @@ class SessionEditorPanel {
     margin-bottom: 12px;
   }
   .form-row label { color: var(--vscode-descriptionForeground); }
-  input[type="text"] {
+  input[type="text"], select {
     background: var(--vscode-input-background);
     color: var(--vscode-input-foreground);
     border: 1px solid var(--vscode-input-border, transparent);
@@ -2426,7 +2543,7 @@ class SessionEditorPanel {
     width: 100%;
     box-sizing: border-box;
   }
-  input[type="text"]:focus {
+  input[type="text"]:focus, select:focus {
     outline: 1px solid var(--vscode-focusBorder);
   }
   button {
@@ -2448,6 +2565,10 @@ class SessionEditorPanel {
     border: 0;
     border-top: 1px solid var(--vscode-panel-border);
     margin: 20px 0;
+  }
+  .hint {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
   }
   .readonly {
     color: var(--vscode-descriptionForeground);
@@ -2479,6 +2600,19 @@ class SessionEditorPanel {
     <button class="secondary" onclick="browse()">Browse…</button>
   </div>
 
+  <div class="form-row">
+    <label for="settings">Settings</label>
+    <select id="settings">
+      ${settingsOptions}
+    </select>
+    <button class="secondary" onclick="browseSettings()">Browse…</button>
+  </div>
+  <div class="form-row">
+    <span></span>
+    <div class="hint">Applies on remake. Alternates are read from ~/.claude</div>
+    <span></span>
+  </div>
+
   <hr/>
 
   <div class="form-row">
@@ -2507,12 +2641,14 @@ class SessionEditorPanel {
       return {
         customName: document.getElementById('name').value,
         directory: document.getElementById('dir').value,
+        settingsFile: document.getElementById('settings').value,
       };
     }
     function save(remake) {
       vscode.postMessage({ type: remake ? 'saveAndRemake' : 'save', patch: patch() });
     }
     function browse() { vscode.postMessage({ type: 'browse' }); }
+    function browseSettings() { vscode.postMessage({ type: 'browseSettings' }); }
     function cancel() { vscode.postMessage({ type: 'cancel' }); }
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') cancel();
@@ -2530,6 +2666,14 @@ class SessionEditorPanel {
       const msg = e.data;
       if (msg.type === 'dirSelected') {
         document.getElementById('dir').value = msg.dir;
+      }
+      if (msg.type === 'settingsSelected') {
+        const sel = document.getElementById('settings');
+        // A file picked from outside the scanned directory has no option yet.
+        if (![...sel.options].some((o) => o.value === msg.file)) {
+          sel.add(new Option(msg.label, msg.file));
+        }
+        sel.value = msg.file;
       }
     });
   </script>
